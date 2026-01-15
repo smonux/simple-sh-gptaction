@@ -1,0 +1,102 @@
+openapi: 3.1.0
+info:
+  title: GPTSH Exec API
+  version: 1.0.0
+  description: |
+    Thin HTTP API for executing commands inside a persistent bash session
+    with Landlock sandboxing enforced by the executor process.
+servers:
+  - url: https://mcp.example.com
+security:
+  - bearerAuth: []
+paths:
+  /exec:
+    post:
+      summary: Execute a shell command in the persistent bash session
+      operationId: execCommand
+      x-openai-isConsequential: false
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+            examples:
+              basic:
+                value:
+                  cmd: "cd /tmp && export X=1 && echo $X"
+                  timeout_ms: 45000
+      responses:
+        "200":
+          description: Execution result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecResponse"
+              examples:
+                success:
+                  value:
+                    id: 1
+                    exit_code: 0
+                    cwd: "/tmp"
+                    stdout: "1\n"
+                    stderr: ""
+                    truncated: false
+                    duration_ms: 12
+        "400":
+          description: Bad request (invalid JSON or missing cmd)
+        "401":
+          description: Unauthorized (missing/invalid API key)
+        "500":
+          description: Internal server error
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ExecRequest:
+      type: object
+      required:
+        - cmd
+      properties:
+        cmd:
+          type: string
+          description: Command to execute inside bash
+        timeout_ms:
+          type: integer
+          description: Timeout in milliseconds (clamped to 45000)
+          minimum: 1
+          maximum: 45000
+    ExecResponse:
+      type: object
+      required:
+        - id
+        - exit_code
+        - cwd
+        - stdout
+        - stderr
+        - truncated
+        - duration_ms
+      properties:
+        id:
+          type: integer
+          format: int64
+        exit_code:
+          type: integer
+        cwd:
+          type: string
+        stdout:
+          type: string
+        stderr:
+          type: string
+        truncated:
+          type: boolean
+        duration_ms:
+          type: integer
+          format: int64
+        error:
+          type: string
+          description: Executor error if one occurred
