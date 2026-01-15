@@ -3,14 +3,15 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-export LISTEN_ADDR="0.0.0.0:8002"
-export API_KEY="TBy30YF0beiYN2Kf"
-export MAX_OUTPUT_CHARS="50000"
-export EXECUTOR_PATH="${ROOT_DIR}/executor"
+CONFIG_FILE="${ROOT_DIR}/config.env"
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "missing ${CONFIG_FILE}; copy config.env.example and fill in values" >&2
+  exit 1
+fi
 
-export WRITE_ALLOW="/path/to/workspace"
-export BIND_TCP_ALLOW="9000:9001:9002:9003:9004:9005"
-export ALLOW_OUTGOING_TCP="true"
-export BASH_PATH="/bin/bash"
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
 
 exec "${ROOT_DIR}/server"
