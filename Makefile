@@ -1,7 +1,7 @@
 GOCACHE := $(CURDIR)/.gocache
 GOMODCACHE := $(CURDIR)/.gomodcache
 GOPATH := $(CURDIR)/.gopath
-GOTOOLCHAIN := local
+GOTOOLCHAIN ?= auto
 
 .PHONY: build test
 

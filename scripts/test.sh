@@ -6,7 +6,8 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export GOCACHE="${ROOT_DIR}/.gocache"
 export GOMODCACHE="${ROOT_DIR}/.gomodcache"
 export GOPATH="${ROOT_DIR}/.gopath"
-export GOTOOLCHAIN=local
+: "${GOTOOLCHAIN:=auto}"
+export GOTOOLCHAIN
 
 API_KEY="testkey"
 LISTEN_ADDR="127.0.0.1:9000"

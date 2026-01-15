@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gptsh/internal/auth"
 	"gptsh/internal/config"
+	"gptsh/internal/mcp"
 	"gptsh/internal/proto"
 )
 
@@ -115,6 +116,26 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	authorizer, err := auth.NewAuthorizer(auth.Config{
+		Mode:                 cfg.AuthMode,
+		APIKey:               cfg.APIKey,
+		OAuthClientID:        cfg.OAuthClientID,
+		OAuthClientSecret:    cfg.OAuthClientSecret,
+		OAuthTokenTTLSeconds: cfg.OAuthTokenTTLSeconds,
+		OAuthCodeTTLSeconds:  cfg.OAuthCodeTTLSeconds,
+		OAuthAllowedScopes:   cfg.OAuthAllowedScopes,
+		OAuthRedirectURIs:    cfg.OAuthRedirectURIs,
+		OAuthUsername:        cfg.OAuthUsername,
+		OAuthPassword:        cfg.OAuthPassword,
+		OAuthAutoApprove:     cfg.OAuthAutoApprove,
+		OAuthSQLitePath:      cfg.OAuthSQLitePath,
+		PublicURL:            cfg.PublicURL,
+		AuthServerURL:        cfg.AuthServerURL,
+	})
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+
 	client, err := newExecClient(cfg.ExecutorPath)
 	if err != nil {
 		log.Fatalf("executor start: %v", err)
@@ -122,14 +143,14 @@ func main() {
 
 	var idCounter int64
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	execHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/exec" {
 			http.NotFound(w, r)
 			return
 		}
 
-		if !authorized(r, cfg.APIKey) {
-			w.WriteHeader(http.StatusUnauthorized)
+		if !authorizer.AuthorizeRequest(r) {
+			authorizer.WriteUnauthorized(w, r)
 			return
 		}
 
@@ -178,20 +199,32 @@ func main() {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
+	mcpHandler := &mcp.Handler{
+		Exec:           client.exec,
+		Auth:           authorizer,
+		MaxBodyBytes:   int64(maxBodyBytes),
+		MaxTimeoutMs:   maxTimeoutMs,
+		MaxOutputChars: cfg.MaxOutputChar,
+		ServerName:     "gptsh-mcp",
+		ServerVersion:  "1.0.0",
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/exec", execHandler)
+	mux.Handle("/mcp", mcpHandler)
+	mux.Handle("/", mcpHandler)
+
+	if authorizer.OAuth() != nil {
+		mux.HandleFunc("/oauth/authorize", authorizer.OAuth().HandleAuthorize)
+		mux.HandleFunc("/oauth/token", authorizer.OAuth().HandleToken)
+		mux.HandleFunc("/.well-known/oauth-protected-resource", authorizer.HandleProtectedResource)
+		mux.HandleFunc("/.well-known/oauth-authorization-server", authorizer.HandleAuthorizationServerMetadata)
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: handler,
+		Handler: mux,
 	}
 	log.Printf("listening on %s", cfg.ListenAddr)
 	log.Fatal(srv.ListenAndServe())
-}
-
-func authorized(r *http.Request, apiKey string) bool {
-	const prefix = "Bearer "
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, prefix) {
-		return false
-	}
-	got := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
-	return subtle.ConstantTimeCompare([]byte(got), []byte(apiKey)) == 1
 }

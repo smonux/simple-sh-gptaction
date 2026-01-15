@@ -14,13 +14,29 @@ const (
 	DefaultBashPath     = "/bin/bash"
 	DefaultAllowIOCTL   = false
 	DefaultExecutorPath = "./executor"
+	DefaultAuthMode     = "api_key"
+	DefaultTokenTTL     = 3600
+	DefaultCodeTTL      = 600
 )
 
 type ServerConfig struct {
-	ListenAddr    string
-	APIKey        string
-	MaxOutputChar int
-	ExecutorPath  string
+	ListenAddr           string
+	APIKey               string
+	MaxOutputChar        int
+	ExecutorPath         string
+	AuthMode             string
+	OAuthClientID        string
+	OAuthClientSecret    string
+	OAuthTokenTTLSeconds int
+	OAuthCodeTTLSeconds  int
+	OAuthAllowedScopes   []string
+	OAuthRedirectURIs    []string
+	OAuthUsername        string
+	OAuthPassword        string
+	OAuthAutoApprove     bool
+	OAuthSQLitePath      string
+	PublicURL            string
+	AuthServerURL        string
 }
 
 type ExecutorConfig struct {
@@ -33,13 +49,55 @@ type ExecutorConfig struct {
 
 func LoadServerConfig() (ServerConfig, error) {
 	cfg := ServerConfig{
-		ListenAddr:    envOr("LISTEN_ADDR", DefaultListenAddr),
-		APIKey:        os.Getenv("API_KEY"),
-		MaxOutputChar: envInt("MAX_OUTPUT_CHARS", DefaultMaxOutput),
-		ExecutorPath:  envOr("EXECUTOR_PATH", DefaultExecutorPath),
+		ListenAddr:           envOr("LISTEN_ADDR", DefaultListenAddr),
+		APIKey:               os.Getenv("API_KEY"),
+		MaxOutputChar:        envInt("MAX_OUTPUT_CHARS", DefaultMaxOutput),
+		ExecutorPath:         envOr("EXECUTOR_PATH", DefaultExecutorPath),
+		AuthMode:             envOr("AUTH_MODE", DefaultAuthMode),
+		OAuthClientID:        strings.TrimSpace(os.Getenv("OAUTH_CLIENT_ID")),
+		OAuthClientSecret:    strings.TrimSpace(os.Getenv("OAUTH_CLIENT_SECRET")),
+		OAuthTokenTTLSeconds: envInt("OAUTH_TOKEN_TTL_SECONDS", DefaultTokenTTL),
+		OAuthCodeTTLSeconds:  envInt("OAUTH_CODE_TTL_SECONDS", DefaultCodeTTL),
+		OAuthAllowedScopes:   splitSpaceList(os.Getenv("OAUTH_ALLOWED_SCOPES")),
+		OAuthRedirectURIs:    splitSpaceList(os.Getenv("OAUTH_REDIRECT_URIS")),
+		OAuthUsername:        strings.TrimSpace(os.Getenv("OAUTH_USERNAME")),
+		OAuthPassword:        strings.TrimSpace(os.Getenv("OAUTH_PASSWORD")),
+		OAuthAutoApprove:     envBoolLoose("OAUTH_AUTO_APPROVE"),
+		OAuthSQLitePath:      strings.TrimSpace(os.Getenv("OAUTH_SQLITE_PATH")),
+		PublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"),
+		AuthServerURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("AUTH_SERVER_URL")), "/"),
 	}
-	if cfg.APIKey == "" {
-		return cfg, fmt.Errorf("API_KEY is required")
+	authMode := strings.ToLower(strings.TrimSpace(cfg.AuthMode))
+	switch authMode {
+	case "api_key":
+		if cfg.APIKey == "" {
+			return cfg, fmt.Errorf("API_KEY is required for AUTH_MODE=api_key")
+		}
+	case "oauth":
+		if cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "" {
+			return cfg, fmt.Errorf("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required for AUTH_MODE=oauth")
+		}
+		if cfg.OAuthSQLitePath == "" {
+			return cfg, fmt.Errorf("OAUTH_SQLITE_PATH is required for AUTH_MODE=oauth")
+		}
+		if !cfg.OAuthAutoApprove && (cfg.OAuthUsername == "" || cfg.OAuthPassword == "") {
+			return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required unless OAUTH_AUTO_APPROVE=true")
+		}
+	case "any":
+		if cfg.APIKey == "" && (cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "") {
+			return cfg, fmt.Errorf("API_KEY or OAuth client credentials are required for AUTH_MODE=any")
+		}
+		if cfg.OAuthClientID != "" && cfg.OAuthClientSecret != "" {
+			if cfg.OAuthSQLitePath == "" {
+				return cfg, fmt.Errorf("OAUTH_SQLITE_PATH is required when OAuth is enabled")
+			}
+			if !cfg.OAuthAutoApprove && (cfg.OAuthUsername == "" || cfg.OAuthPassword == "") {
+				return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required unless OAUTH_AUTO_APPROVE=true")
+			}
+		}
+	case "none":
+	default:
+		return cfg, fmt.Errorf("invalid AUTH_MODE %q", cfg.AuthMode)
 	}
 	return cfg, nil
 }
@@ -100,6 +158,18 @@ func envBool(key string, def bool) (bool, error) {
 	return b, nil
 }
 
+func envBoolLoose(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
 func splitList(v string) []string {
 	if strings.TrimSpace(v) == "" {
 		return nil
@@ -113,6 +183,13 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+func splitSpaceList(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return strings.Fields(v)
 }
 
 func parsePorts(v string) ([]uint16, error) {
