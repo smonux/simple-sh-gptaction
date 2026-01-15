@@ -57,6 +57,7 @@ func main() {
 		}
 		if err != nil {
 			resp.Error = err.Error()
+			log.Printf("exec error: id=%d err=%v", req.ID, err)
 		}
 		payload, err := json.Marshal(resp)
 		if err != nil {

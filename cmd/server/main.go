@@ -240,7 +240,7 @@ func main() {
 		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
 		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
 		log.Printf(
-			"exec response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q",
+			"exec response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q error=%q",
 			resp.ID,
 			resp.ExitCode,
 			resp.DurationMs,
@@ -251,6 +251,7 @@ func main() {
 			stderrTrunc,
 			stdout,
 			stderr,
+			resp.Error,
 		)
 
 		w.Header().Set("Content-Type", "application/json")

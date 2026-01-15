@@ -239,18 +239,22 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 	if h.Logf != nil {
 		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
 		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
+		errText, errTrunc := truncateForLog(resp.Error, 4000)
 		h.Logf(
-			"mcp tools/call response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q",
+			"mcp tools/call response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d err_len=%d stdout_trunc=%t stderr_trunc=%t err_trunc=%t stdout=%q stderr=%q error=%q",
 			resp.ID,
 			resp.ExitCode,
 			resp.DurationMs,
 			resp.Truncated,
 			len(resp.Stdout),
 			len(resp.Stderr),
+			len(resp.Error),
 			stdoutTrunc,
 			stderrTrunc,
+			errTrunc,
 			stdout,
 			stderr,
+			errText,
 		)
 	}
 
@@ -260,6 +264,12 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 			text += "\n"
 		}
 		text += "stderr:\n" + resp.Stderr
+	}
+	if resp.Error != "" {
+		if text != "" && !strings.HasSuffix(text, "\n") {
+			text += "\n"
+		}
+		text += "error:\n" + resp.Error
 	}
 	if text == "" {
 		text = "(no output)"
