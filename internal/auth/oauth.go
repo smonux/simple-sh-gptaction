@@ -16,28 +16,24 @@ import (
 
 type OAuthConfig struct {
 	ClientID      string
-	ClientSecret  string
 	TokenTTL      time.Duration
 	CodeTTL       time.Duration
 	AllowedScopes []string
 	RedirectURIs  []string
 	Username      string
 	Password      string
-	AutoApprove   bool
 	TokenStore    tokenStore
 	CodeStore     codeStore
 }
 
 type OAuthServer struct {
 	clientID      string
-	clientSecret  string
 	tokenTTL      time.Duration
 	codeTTL       time.Duration
 	allowedScopes map[string]struct{}
 	redirectURIs  map[string]struct{}
 	username      string
 	password      string
-	autoApprove   bool
 	tokens        tokenStore
 	codes         codeStore
 }
@@ -63,14 +59,12 @@ func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
 	}
 	return &OAuthServer{
 		clientID:      cfg.ClientID,
-		clientSecret:  cfg.ClientSecret,
 		tokenTTL:      cfg.TokenTTL,
 		codeTTL:       cfg.CodeTTL,
 		allowedScopes: allowed,
 		redirectURIs:  redirects,
 		username:      cfg.Username,
 		password:      cfg.Password,
-		autoApprove:   cfg.AutoApprove,
 		tokens:        cfg.TokenStore,
 		codes:         cfg.CodeStore,
 	}, nil
@@ -116,25 +110,23 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	params.CodeChallengeMethod = method
 
-	if !o.autoApprove {
-		if o.username == "" || o.password == "" {
-			http.Error(w, "authorization server not configured for interactive login", http.StatusInternalServerError)
-			return
-		}
-		if r.Method == http.MethodGet {
-			o.renderLogin(w, params, "")
-			return
-		}
-		if err := r.ParseForm(); err != nil {
-			o.renderLogin(w, params, "invalid form")
-			return
-		}
-		user := strings.TrimSpace(r.FormValue("username"))
-		pass := strings.TrimSpace(r.FormValue("password"))
-		if !subtleCompare(user, o.username) || !subtleCompare(pass, o.password) {
-			o.renderLogin(w, params, "invalid credentials")
-			return
-		}
+	if o.username == "" || o.password == "" {
+		http.Error(w, "authorization server not configured for interactive login", http.StatusInternalServerError)
+		return
+	}
+	if r.Method == http.MethodGet {
+		o.renderLogin(w, params, "")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		o.renderLogin(w, params, "invalid form")
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("username"))
+	pass := strings.TrimSpace(r.FormValue("password"))
+	if !subtleCompare(user, o.username) || !subtleCompare(pass, o.password) {
+		o.renderLogin(w, params, "invalid credentials")
+		return
 	}
 
 	scope := o.filterScopes(params.Scope)
@@ -168,9 +160,13 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID, clientSecret := parseClientCredentials(r)
-	if !o.validClient(clientID, clientSecret) {
+	clientID, hasSecret := parseClientID(r)
+	if !o.validClient(clientID) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
+		return
+	}
+	if hasSecret {
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client_secret is not accepted")
 		return
 	}
 
@@ -240,11 +236,11 @@ func (o *OAuthServer) filterScopes(scope string) string {
 	return strings.Join(out, " ")
 }
 
-func (o *OAuthServer) validClient(id, secret string) bool {
-	if id == "" || secret == "" {
+func (o *OAuthServer) validClient(id string) bool {
+	if id == "" {
 		return false
 	}
-	return subtleCompare(id, o.clientID) && subtleCompare(secret, o.clientSecret)
+	return subtleCompare(id, o.clientID)
 }
 
 func (o *OAuthServer) resolveRedirectURI(redirectURI string) (string, error) {
@@ -363,11 +359,16 @@ func buildRedirectURL(redirectURI, code, state, errCode string) (string, error) 
 	return parsed.String(), nil
 }
 
-func parseClientCredentials(r *http.Request) (string, string) {
+func parseClientID(r *http.Request) (string, bool) {
 	if id, secret, ok := parseBasicAuth(r.Header.Get("Authorization")); ok {
-		return id, secret
+		if secret != "" {
+			return id, true
+		}
+		return id, false
 	}
-	return strings.TrimSpace(r.FormValue("client_id")), strings.TrimSpace(r.FormValue("client_secret"))
+	id := strings.TrimSpace(r.FormValue("client_id"))
+	secret := strings.TrimSpace(r.FormValue("client_secret"))
+	return id, secret != ""
 }
 
 func parseBasicAuth(header string) (string, string, bool) {

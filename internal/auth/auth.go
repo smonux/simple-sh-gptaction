@@ -21,14 +21,12 @@ type Config struct {
 	Mode                 string
 	APIKey               string
 	OAuthClientID        string
-	OAuthClientSecret    string
 	OAuthTokenTTLSeconds int
 	OAuthCodeTTLSeconds  int
 	OAuthAllowedScopes   []string
 	OAuthRedirectURIs    []string
 	OAuthUsername        string
 	OAuthPassword        string
-	OAuthAutoApprove     bool
 	OAuthSQLitePath      string
 	PublicURL            string
 	AuthServerURL        string
@@ -55,12 +53,12 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 			return nil, fmt.Errorf("API_KEY is required for auth mode %q", mode)
 		}
 	case ModeOAuth:
-		if cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "" {
-			return nil, fmt.Errorf("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required for auth mode %q", mode)
+		if cfg.OAuthClientID == "" {
+			return nil, fmt.Errorf("OAUTH_CLIENT_ID is required for auth mode %q", mode)
 		}
 	case ModeAny:
-		if cfg.APIKey == "" && (cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "") {
-			return nil, fmt.Errorf("API_KEY or OAuth client credentials are required for auth mode %q", mode)
+		if cfg.APIKey == "" && cfg.OAuthClientID == "" {
+			return nil, fmt.Errorf("API_KEY or OAUTH_CLIENT_ID are required for auth mode %q", mode)
 		}
 	default:
 		return nil, fmt.Errorf("invalid AUTH_MODE %q", cfg.Mode)
@@ -70,7 +68,7 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		oauth *OAuthServer
 		err   error
 	)
-	if cfg.OAuthClientID != "" && cfg.OAuthClientSecret != "" {
+	if cfg.OAuthClientID != "" {
 		var tokenStore tokenStore
 		var codeStore codeStore
 		if cfg.OAuthSQLitePath != "" {
@@ -91,14 +89,12 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		}
 		oauth, err = NewOAuthServer(OAuthConfig{
 			ClientID:      cfg.OAuthClientID,
-			ClientSecret:  cfg.OAuthClientSecret,
 			TokenTTL:      ttl,
 			CodeTTL:       codeTTL,
 			AllowedScopes: cfg.OAuthAllowedScopes,
 			RedirectURIs:  cfg.OAuthRedirectURIs,
 			Username:      cfg.OAuthUsername,
 			Password:      cfg.OAuthPassword,
-			AutoApprove:   cfg.OAuthAutoApprove,
 			TokenStore:    tokenStore,
 			CodeStore:     codeStore,
 		})

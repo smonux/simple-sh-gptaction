@@ -26,14 +26,12 @@ type ServerConfig struct {
 	ExecutorPath         string
 	AuthMode             string
 	OAuthClientID        string
-	OAuthClientSecret    string
 	OAuthTokenTTLSeconds int
 	OAuthCodeTTLSeconds  int
 	OAuthAllowedScopes   []string
 	OAuthRedirectURIs    []string
 	OAuthUsername        string
 	OAuthPassword        string
-	OAuthAutoApprove     bool
 	OAuthSQLitePath      string
 	PublicURL            string
 	AuthServerURL        string
@@ -55,14 +53,12 @@ func LoadServerConfig() (ServerConfig, error) {
 		ExecutorPath:         envOr("EXECUTOR_PATH", DefaultExecutorPath),
 		AuthMode:             envOr("AUTH_MODE", DefaultAuthMode),
 		OAuthClientID:        strings.TrimSpace(os.Getenv("OAUTH_CLIENT_ID")),
-		OAuthClientSecret:    strings.TrimSpace(os.Getenv("OAUTH_CLIENT_SECRET")),
 		OAuthTokenTTLSeconds: envInt("OAUTH_TOKEN_TTL_SECONDS", DefaultTokenTTL),
 		OAuthCodeTTLSeconds:  envInt("OAUTH_CODE_TTL_SECONDS", DefaultCodeTTL),
 		OAuthAllowedScopes:   splitSpaceList(os.Getenv("OAUTH_ALLOWED_SCOPES")),
 		OAuthRedirectURIs:    splitSpaceList(os.Getenv("OAUTH_REDIRECT_URIS")),
 		OAuthUsername:        strings.TrimSpace(os.Getenv("OAUTH_USERNAME")),
 		OAuthPassword:        strings.TrimSpace(os.Getenv("OAUTH_PASSWORD")),
-		OAuthAutoApprove:     envBoolLoose("OAUTH_AUTO_APPROVE"),
 		OAuthSQLitePath:      strings.TrimSpace(os.Getenv("OAUTH_SQLITE_PATH")),
 		PublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"),
 		AuthServerURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("AUTH_SERVER_URL")), "/"),
@@ -74,25 +70,25 @@ func LoadServerConfig() (ServerConfig, error) {
 			return cfg, fmt.Errorf("API_KEY is required for AUTH_MODE=api_key")
 		}
 	case "oauth":
-		if cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "" {
-			return cfg, fmt.Errorf("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required for AUTH_MODE=oauth")
+		if cfg.OAuthClientID == "" {
+			return cfg, fmt.Errorf("OAUTH_CLIENT_ID is required for AUTH_MODE=oauth")
 		}
 		if cfg.OAuthSQLitePath == "" {
 			return cfg, fmt.Errorf("OAUTH_SQLITE_PATH is required for AUTH_MODE=oauth")
 		}
-		if !cfg.OAuthAutoApprove && (cfg.OAuthUsername == "" || cfg.OAuthPassword == "") {
-			return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required unless OAUTH_AUTO_APPROVE=true")
+		if cfg.OAuthUsername == "" || cfg.OAuthPassword == "" {
+			return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required for AUTH_MODE=oauth")
 		}
 	case "any":
-		if cfg.APIKey == "" && (cfg.OAuthClientID == "" || cfg.OAuthClientSecret == "") {
-			return cfg, fmt.Errorf("API_KEY or OAuth client credentials are required for AUTH_MODE=any")
+		if cfg.APIKey == "" && cfg.OAuthClientID == "" {
+			return cfg, fmt.Errorf("API_KEY or OAUTH_CLIENT_ID are required for AUTH_MODE=any")
 		}
-		if cfg.OAuthClientID != "" && cfg.OAuthClientSecret != "" {
+		if cfg.OAuthClientID != "" {
 			if cfg.OAuthSQLitePath == "" {
 				return cfg, fmt.Errorf("OAUTH_SQLITE_PATH is required when OAuth is enabled")
 			}
-			if !cfg.OAuthAutoApprove && (cfg.OAuthUsername == "" || cfg.OAuthPassword == "") {
-				return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required unless OAUTH_AUTO_APPROVE=true")
+			if cfg.OAuthUsername == "" || cfg.OAuthPassword == "" {
+				return cfg, fmt.Errorf("OAUTH_USERNAME and OAUTH_PASSWORD are required when OAuth is enabled")
 			}
 		}
 	case "none":
