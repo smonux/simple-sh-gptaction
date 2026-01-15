@@ -143,6 +143,13 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
+func truncateForLog(s string, max int) (string, bool) {
+	if max <= 0 || len(s) <= max {
+		return s, false
+	}
+	return s[:max] + "...(truncated)", true
+}
+
 func main() {
 	cfg, err := config.LoadServerConfig()
 	if err != nil {
@@ -196,6 +203,8 @@ func main() {
 			return
 		}
 
+		log.Printf("exec request: cmd=%q timeout_ms=%d", req.Cmd, req.TimeoutMs)
+
 		timeout := req.TimeoutMs
 		if timeout <= 0 || timeout > maxTimeoutMs {
 			timeout = maxTimeoutMs
@@ -221,10 +230,27 @@ func main() {
 					Stderr:   "timeout; shell reset",
 				}
 			} else {
+				log.Printf("exec error: %v", err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 		}
+
+		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
+		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
+		log.Printf(
+			"exec response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q",
+			resp.ID,
+			resp.ExitCode,
+			resp.DurationMs,
+			resp.Truncated,
+			len(resp.Stdout),
+			len(resp.Stderr),
+			stdoutTrunc,
+			stderrTrunc,
+			stdout,
+			stderr,
+		)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -233,6 +259,7 @@ func main() {
 	mcpHandler := &mcp.Handler{
 		Exec:           client.exec,
 		Auth:           authorizer,
+		Logf:           log.Printf,
 		MaxBodyBytes:   int64(maxBodyBytes),
 		MaxTimeoutMs:   maxTimeoutMs,
 		MaxOutputChars: cfg.MaxOutputChar,

@@ -22,6 +22,7 @@ type ExecFunc func(context.Context, proto.ExecRequest) (proto.ExecResponse, erro
 type Handler struct {
 	Exec           ExecFunc
 	Auth           *auth.Authorizer
+	Logf           func(string, ...any)
 	MaxBodyBytes   int64
 	MaxTimeoutMs   int
 	MaxOutputChars int
@@ -201,6 +202,10 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 		return req.errorResponse(errInvalidParams, "cmd is required")
 	}
 
+	if h.Logf != nil {
+		h.Logf("mcp tools/call request: cmd=%q timeout_ms=%d", args.Cmd, args.TimeoutMs)
+	}
+
 	timeout := args.TimeoutMs
 	if timeout <= 0 || timeout > h.MaxTimeoutMs {
 		timeout = h.MaxTimeoutMs
@@ -224,8 +229,29 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 				Stderr:   "timeout; shell reset",
 			}
 		} else {
+			if h.Logf != nil {
+				h.Logf("mcp tools/call error: %v", err)
+			}
 			return req.errorResponse(errInternal, "execution failed")
 		}
+	}
+
+	if h.Logf != nil {
+		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
+		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
+		h.Logf(
+			"mcp tools/call response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q",
+			resp.ID,
+			resp.ExitCode,
+			resp.DurationMs,
+			resp.Truncated,
+			len(resp.Stdout),
+			len(resp.Stderr),
+			stdoutTrunc,
+			stderrTrunc,
+			stdout,
+			stderr,
+		)
 	}
 
 	text := resp.Stdout
@@ -268,6 +294,13 @@ func readBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, e
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	defer r.Body.Close()
 	return io.ReadAll(r.Body)
+}
+
+func truncateForLog(s string, max int) (string, bool) {
+	if max <= 0 || len(s) <= max {
+		return s, false
+	}
+	return s[:max] + "...(truncated)", true
 }
 
 type jsonRPCRequest struct {
