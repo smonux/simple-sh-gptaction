@@ -30,6 +30,7 @@ type Config struct {
 	OAuthSQLitePath      string
 	PublicURL            string
 	AuthServerURL        string
+	Logf                 func(string, ...any)
 }
 
 type Authorizer struct {
@@ -38,6 +39,7 @@ type Authorizer struct {
 	oauth         *OAuthServer
 	publicURL     string
 	authServerURL string
+	logf          func(string, ...any)
 }
 
 func NewAuthorizer(cfg Config) (*Authorizer, error) {
@@ -95,6 +97,7 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 			RedirectURIs:  cfg.OAuthRedirectURIs,
 			Username:      cfg.OAuthUsername,
 			Password:      cfg.OAuthPassword,
+			Logf:          cfg.Logf,
 			TokenStore:    tokenStore,
 			CodeStore:     codeStore,
 		})
@@ -109,6 +112,7 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		oauth:         oauth,
 		publicURL:     strings.TrimRight(cfg.PublicURL, "/"),
 		authServerURL: strings.TrimRight(cfg.AuthServerURL, "/"),
+		logf:          cfg.Logf,
 	}, nil
 }
 
@@ -122,24 +126,46 @@ func (a *Authorizer) AuthorizeRequest(r *http.Request) bool {
 	}
 	token := parseBearer(r)
 	if token == "" {
+		a.logAuth("missing bearer token", r)
 		return false
 	}
 	switch a.mode {
 	case ModeAPIKey:
-		return subtle.ConstantTimeCompare([]byte(token), []byte(a.apiKey)) == 1
+		ok := subtle.ConstantTimeCompare([]byte(token), []byte(a.apiKey)) == 1
+		if !ok {
+			a.logAuth("api key mismatch", r)
+		}
+		return ok
 	case ModeOAuth:
-		return a.oauth != nil && a.oauth.Validate(token)
+		if a.oauth == nil {
+			a.logAuth("oauth not configured", r)
+			return false
+		}
+		ok := a.oauth.Validate(token)
+		if !ok {
+			a.logAuth("oauth token invalid", r)
+		}
+		return ok
 	case ModeAny:
 		if a.apiKey != "" && subtle.ConstantTimeCompare([]byte(token), []byte(a.apiKey)) == 1 {
 			return true
 		}
-		return a.oauth != nil && a.oauth.Validate(token)
+		if a.oauth == nil {
+			a.logAuth("oauth not configured", r)
+			return false
+		}
+		ok := a.oauth.Validate(token)
+		if !ok {
+			a.logAuth("oauth token invalid", r)
+		}
+		return ok
 	default:
 		return false
 	}
 }
 
 func (a *Authorizer) WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
+	a.logAuth("unauthorized", r)
 	if a.mode == ModeOAuth || a.mode == ModeAny {
 		metaURL := a.resourceMetadataURL(r)
 		if metaURL != "" {
@@ -147,6 +173,28 @@ func (a *Authorizer) WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+func (a *Authorizer) logAuth(msg string, r *http.Request) {
+	if a.logf == nil {
+		return
+	}
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
+	}
+	remote := ""
+	if r != nil {
+		remote = r.RemoteAddr
+	}
+	a.logf("auth: %s method=%s path=%s remote=%s", msg, safeMethod(r), path, remote)
+}
+
+func safeMethod(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return r.Method
 }
 
 func (a *Authorizer) resourceMetadataURL(r *http.Request) string {

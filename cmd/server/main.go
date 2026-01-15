@@ -169,6 +169,7 @@ func main() {
 		OAuthSQLitePath:      cfg.OAuthSQLitePath,
 		PublicURL:            cfg.PublicURL,
 		AuthServerURL:        cfg.AuthServerURL,
+		Logf:                 log.Printf,
 	})
 	if err != nil {
 		log.Fatalf("auth: %v", err)

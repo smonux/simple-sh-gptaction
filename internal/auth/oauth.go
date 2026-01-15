@@ -24,6 +24,7 @@ type OAuthConfig struct {
 	Password      string
 	TokenStore    tokenStore
 	CodeStore     codeStore
+	Logf          func(string, ...any)
 }
 
 type OAuthServer struct {
@@ -36,6 +37,7 @@ type OAuthServer struct {
 	password      string
 	tokens        tokenStore
 	codes         codeStore
+	logf          func(string, ...any)
 }
 
 func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
@@ -67,6 +69,7 @@ func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
 		password:      cfg.Password,
 		tokens:        cfg.TokenStore,
 		codes:         cfg.CodeStore,
+		logf:          cfg.Logf,
 	}, nil
 }
 
@@ -78,25 +81,31 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	params, err := parseAuthorizeParams(r)
 	if err != nil {
+		o.logfSafe("oauth authorize error: code=invalid_request desc=%q", err.Error())
 		o.writeAuthorizeError(w, r, params, "invalid_request", err.Error())
 		return
 	}
+	o.logfSafe("oauth authorize request: client_id=%s redirect_uri=%s scope=%s method=%s", params.ClientID, params.RedirectURI, params.Scope, r.Method)
 	if !subtleCompare(params.ClientID, o.clientID) {
+		o.logfSafe("oauth authorize error: code=unauthorized_client client_id=%s", params.ClientID)
 		o.writeAuthorizeError(w, r, params, "unauthorized_client", "unknown client_id")
 		return
 	}
 	if params.ResponseType != "code" {
+		o.logfSafe("oauth authorize error: code=unsupported_response_type client_id=%s response_type=%s", params.ClientID, params.ResponseType)
 		o.writeAuthorizeError(w, r, params, "unsupported_response_type", "response_type must be code")
 		return
 	}
 	redirectURI, err := o.resolveRedirectURI(params.RedirectURI)
 	if err != nil {
+		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s redirect_uri=%s", params.ClientID, params.RedirectURI)
 		o.writeAuthorizeError(w, r, params, "invalid_request", err.Error())
 		return
 	}
 	params.RedirectURI = redirectURI
 
 	if params.CodeChallenge == "" {
+		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s missing_code_challenge", params.ClientID)
 		o.writeAuthorizeError(w, r, params, "invalid_request", "code_challenge is required")
 		return
 	}
@@ -105,12 +114,14 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		method = "plain"
 	}
 	if method != "S256" && method != "plain" {
+		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s code_challenge_method=%s", params.ClientID, method)
 		o.writeAuthorizeError(w, r, params, "invalid_request", "unsupported code_challenge_method")
 		return
 	}
 	params.CodeChallengeMethod = method
 
 	if o.username == "" || o.password == "" {
+		o.logfSafe("oauth authorize error: login not configured")
 		http.Error(w, "authorization server not configured for interactive login", http.StatusInternalServerError)
 		return
 	}
@@ -119,12 +130,14 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
+		o.logfSafe("oauth authorize error: invalid form")
 		o.renderLogin(w, params, "invalid form")
 		return
 	}
 	user := strings.TrimSpace(r.FormValue("username"))
 	pass := strings.TrimSpace(r.FormValue("password"))
 	if !subtleCompare(user, o.username) || !subtleCompare(pass, o.password) {
+		o.logfSafe("oauth authorize error: invalid credentials client_id=%s redirect_uri=%s", params.ClientID, params.RedirectURI)
 		o.renderLogin(w, params, "invalid credentials")
 		return
 	}
@@ -138,12 +151,15 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		scope:               scope,
 	})
 	if err != nil {
+		o.logfSafe("oauth authorize error: failed to issue code client_id=%s", params.ClientID)
 		http.Error(w, "failed to issue code", http.StatusInternalServerError)
 		return
 	}
+	o.logfSafe("oauth authorize success: client_id=%s redirect_uri=%s scope=%s", params.ClientID, params.RedirectURI, scope)
 
 	redirect, err := buildRedirectURL(params.RedirectURI, code, params.State, "")
 	if err != nil {
+		o.logfSafe("oauth authorize error: invalid redirect_uri client_id=%s redirect_uri=%s", params.ClientID, params.RedirectURI)
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
@@ -156,16 +172,20 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
+		o.logfSafe("oauth token error: invalid_request invalid form body")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid form body")
 		return
 	}
 
 	clientID, hasSecret := parseClientID(r)
+	o.logfSafe("oauth token request: client_id=%s grant_type=%s", clientID, r.FormValue("grant_type"))
 	if !o.validClient(clientID) {
+		o.logfSafe("oauth token error: invalid_client client_id=%s", clientID)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
 		return
 	}
 	if hasSecret {
+		o.logfSafe("oauth token error: client_secret not accepted client_id=%s", clientID)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client_secret is not accepted")
 		return
 	}
@@ -175,6 +195,7 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		grantType = "authorization_code"
 	}
 	if grantType != "authorization_code" {
+		o.logfSafe("oauth token error: unsupported_grant_type client_id=%s grant_type=%s", clientID, grantType)
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only authorization_code is supported")
 		return
 	}
@@ -183,25 +204,30 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 	redirectURI := strings.TrimSpace(r.FormValue("redirect_uri"))
 	verifier := strings.TrimSpace(r.FormValue("code_verifier"))
 	if code == "" || verifier == "" {
+		o.logfSafe("oauth token error: invalid_request missing code or verifier client_id=%s", clientID)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code and code_verifier are required")
 		return
 	}
 	if redirectURI == "" {
+		o.logfSafe("oauth token error: invalid_request missing redirect_uri client_id=%s", clientID)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri is required")
 		return
 	}
 
 	scope, err := o.codes.consumeCode(code, clientID, redirectURI, verifier)
 	if err != nil {
+		o.logfSafe("oauth token error: invalid_grant client_id=%s redirect_uri=%s", clientID, redirectURI)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		return
 	}
 
 	token, err := o.tokens.issueToken(o.tokenTTL, scope)
 	if err != nil {
+		o.logfSafe("oauth token error: server_error client_id=%s", clientID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token")
 		return
 	}
+	o.logfSafe("oauth token success: client_id=%s scope=%s expires_in=%d", clientID, scope, int(token.TTL.Seconds()))
 	resp := map[string]any{
 		"access_token": token.Value,
 		"token_type":   "Bearer",
@@ -394,6 +420,13 @@ func writeOAuthError(w http.ResponseWriter, status int, code, desc string) {
 		"error":             code,
 		"error_description": desc,
 	})
+}
+
+func (o *OAuthServer) logfSafe(format string, args ...any) {
+	if o == nil || o.logf == nil {
+		return
+	}
+	o.logf(format, args...)
 }
 
 type authorizeParams struct {
