@@ -110,6 +110,39 @@ type execRequest struct {
 	TimeoutMs int    `json:"timeout_ms"`
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += n
+	return n, err
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("%s %s %d %dB %s", r.Method, r.URL.Path, status, rec.bytes, time.Since(start))
+	})
+}
+
 func main() {
 	cfg, err := config.LoadServerConfig()
 	if err != nil {
@@ -221,7 +254,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: mux,
+		Handler: logRequests(mux),
 	}
 	log.Printf("listening on %s", cfg.ListenAddr)
 	log.Fatal(srv.ListenAndServe())
