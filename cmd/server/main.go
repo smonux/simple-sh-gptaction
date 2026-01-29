@@ -190,6 +190,21 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func truncateForLog(s string, max int) (string, bool) {
 	if max <= 0 || len(s) <= max {
 		return s, false
@@ -360,7 +375,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: logRequests(mux),
+		Handler: logRequests(withCORS(mux)),
 	}
 	log.Printf("listening on %s", cfg.ListenAddr)
 	log.Fatal(srv.ListenAndServe())
