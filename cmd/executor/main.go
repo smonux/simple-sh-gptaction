@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
+	"strings"
+	"syscall"
 
 	"gptsh/internal/config"
 	"gptsh/internal/proto"
@@ -45,19 +48,19 @@ func main() {
 		if err := json.Unmarshal(frame, &req); err != nil {
 			log.Fatalf("decode request: %v", err)
 		}
-		stdout, stderr, exitCode, cwd, truncated, durationMs, err := bash.Exec(req.Cmd, req.MaxOutputChars)
-		resp := proto.ExecResponse{
-			ID:         req.ID,
-			ExitCode:   exitCode,
-			Cwd:        cwd,
-			Stdout:     stdout,
-			Stderr:     stderr,
-			Truncated:  truncated,
-			DurationMs: durationMs,
+		resp, execErr := runExec(bash, req)
+		if execErr != nil && isBrokenPipe(execErr) {
+			log.Printf("bash pipe error: %v (restarting shell)", execErr)
+			_ = bash.Close()
+			bash, err = shell.Start(cfg.BashPath)
+			if err != nil {
+				log.Fatalf("bash restart: %v", err)
+			}
+			resp, execErr = runExec(bash, req)
 		}
-		if err != nil {
-			resp.Error = err.Error()
-			log.Printf("exec error: id=%d err=%v", req.ID, err)
+		if execErr != nil {
+			resp.Error = execErr.Error()
+			log.Printf("exec error: id=%d err=%v", req.ID, execErr)
 		}
 		payload, err := json.Marshal(resp)
 		if err != nil {
@@ -67,4 +70,29 @@ func main() {
 			log.Fatalf("write frame: %v", err)
 		}
 	}
+}
+
+func runExec(bash *shell.Bash, req proto.ExecRequest) (proto.ExecResponse, error) {
+	stdout, stderr, exitCode, cwd, truncated, durationMs, err := bash.Exec(req.Cmd, req.MaxOutputChars)
+	resp := proto.ExecResponse{
+		ID:         req.ID,
+		ExitCode:   exitCode,
+		Cwd:        cwd,
+		Stdout:     stdout,
+		Stderr:     stderr,
+		Truncated:  truncated,
+		DurationMs: durationMs,
+	}
+	return resp, err
+}
+
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "pipe")
 }
