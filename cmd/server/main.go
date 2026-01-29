@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,8 @@ import (
 	"gptsh/internal/config"
 	"gptsh/internal/mcp"
 	"gptsh/internal/proto"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -110,6 +113,50 @@ type execRequest struct {
 	TimeoutMs int    `json:"timeout_ms"`
 }
 
+type openAPICache struct {
+	once    sync.Once
+	yaml    []byte
+	json    []byte
+	loadErr error
+}
+
+func (c *openAPICache) load() {
+	exe, err := os.Executable()
+	if err != nil {
+		c.loadErr = err
+		return
+	}
+	path := filepath.Join(filepath.Dir(exe), "openapi.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.loadErr = err
+		return
+	}
+	c.yaml = data
+
+	var doc any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		c.loadErr = err
+		return
+	}
+	converted, err := json.Marshal(doc)
+	if err != nil {
+		c.loadErr = err
+		return
+	}
+	c.json = converted
+}
+
+func (c *openAPICache) getJSON() ([]byte, error) {
+	c.once.Do(c.load)
+	return c.json, c.loadErr
+}
+
+func (c *openAPICache) getYAML() ([]byte, error) {
+	c.once.Do(c.load)
+	return c.yaml, c.loadErr
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -155,6 +202,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+
+	openapi := &openAPICache{}
 
 	authorizer, err := auth.NewAuthorizer(auth.Config{
 		Mode:                 cfg.AuthMode,
@@ -271,6 +320,34 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/exec", execHandler)
+	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := openapi.getJSON()
+		if err != nil || len(data) == 0 {
+			log.Printf("openapi.json error: %v", err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	})
+	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := openapi.getYAML()
+		if err != nil || len(data) == 0 {
+			log.Printf("openapi.yaml error: %v", err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = w.Write(data)
+	})
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/", mcpHandler)
 
