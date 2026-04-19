@@ -2,5 +2,6 @@
 .gomodcache/
 .gopath/
 config.env
+oauth.sqlite
 /server
 /executor
