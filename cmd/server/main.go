@@ -120,6 +120,33 @@ type openAPICache struct {
 	loadErr error
 }
 
+type staticFileCache struct {
+	once    sync.Once
+	name    string
+	data    []byte
+	loadErr error
+}
+
+func (c *staticFileCache) load() {
+	exe, err := os.Executable()
+	if err != nil {
+		c.loadErr = err
+		return
+	}
+	path := filepath.Join(filepath.Dir(exe), c.name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.loadErr = err
+		return
+	}
+	c.data = data
+}
+
+func (c *staticFileCache) get() ([]byte, error) {
+	c.once.Do(c.load)
+	return c.data, c.loadErr
+}
+
 func (c *openAPICache) load() {
 	exe, err := os.Executable()
 	if err != nil {
@@ -219,6 +246,7 @@ func main() {
 	}
 
 	openapi := &openAPICache{}
+	privacyPolicy := &staticFileCache{name: "privacy-policy.html"}
 
 	authorizer, err := auth.NewAuthorizer(auth.Config{
 		Mode:                 cfg.AuthMode,
@@ -363,6 +391,25 @@ func main() {
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(data)
 	})
+	privacyPolicyHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := privacyPolicy.get()
+		if err != nil || len(data) == 0 {
+			log.Printf("privacy policy error: %v", err)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = w.Write(data)
+	}
+	mux.HandleFunc("/privacy-policy", privacyPolicyHandler)
+	mux.HandleFunc("/privacy-policy.html", privacyPolicyHandler)
 	mux.Handle("/mcp", mcpHandler)
 	mux.Handle("/", mcpHandler)
 

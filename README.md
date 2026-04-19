@@ -30,6 +30,10 @@ The legacy exec endpoint remains at:
 
 - `http(s)://<host>/exec`
 
+The privacy policy page is available at:
+
+- `http(s)://<host>/privacy-policy`
+
 ## Configuration
 
 All configuration lives in `config.env` (loaded by `run.sh`).
