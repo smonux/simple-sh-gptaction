@@ -29,6 +29,10 @@ run_server() {
   local outgoing="$1"
   export LISTEN_ADDR
   export API_KEY
+  # Keep these sandbox checks independent of the caller's deployment config.
+  export AUTH_MODE="api_key"
+  export OAUTH_CLIENT_ID=""
+  export DISABLE_ACTION="false"
   export MAX_OUTPUT_CHARS
   export EXECUTOR_PATH
   export WRITE_ALLOW="/tmp"

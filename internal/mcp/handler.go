@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -15,7 +17,7 @@ import (
 	"gptsh/internal/proto"
 )
 
-const defaultProtocolVersion = "2024-11-05"
+const defaultProtocolVersion = "2025-06-18"
 
 type ExecFunc func(context.Context, proto.ExecRequest) (proto.ExecResponse, error)
 
@@ -28,25 +30,38 @@ type Handler struct {
 	MaxOutputChars int
 	ServerName     string
 	ServerVersion  string
+	PublicURL      string
 
 	idCounter int64
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": h.ServerName,
-		})
+	// Stateless Streamable HTTP: POST returns JSON. No SSE stream or transport
+	// session is advertised; the personal shell persists independently.
+	if !h.allowedOrigin(r) {
+		http.Error(w, "origin is not allowed", http.StatusForbidden)
 		return
 	}
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	if h.Auth != nil && !h.Auth.AuthorizeRequest(r) {
 		h.Auth.WriteUnauthorized(w, r)
+		return
+	}
+	if version := r.Header.Get("MCP-Protocol-Version"); version != "" && !supportedVersion(version) {
+		http.Error(w, "unsupported MCP protocol version", http.StatusBadRequest)
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	if !accepts(r.Header.Get("Accept"), "application/json") || !accepts(r.Header.Get("Accept"), "text/event-stream") {
+		w.WriteHeader(http.StatusNotAcceptable)
 		return
 	}
 
@@ -59,14 +74,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	var request jsonRPCRequest
+	if json.Unmarshal(body, &request) == nil && request.Method == "tools/call" &&
+		h.Auth != nil && !h.Auth.AuthorizeRequest(r, "tools.execute") {
+		h.Auth.WriteUnauthorized(w, r, "tools.execute")
+		return
+	}
 
 	responses, ok := h.handlePayload(r.Context(), body)
 	if !ok {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(rpcError(nil, errParse, "parse error"))
 		return
 	}
 	if len(responses) == 0 {
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -84,18 +107,8 @@ func (h *Handler) handlePayload(ctx context.Context, body []byte) ([]jsonRPCResp
 	if len(trimmed) == 0 {
 		return nil, false
 	}
-	if trimmed[0] == '[' {
-		var batch []jsonRPCRequest
-		if err := json.Unmarshal(trimmed, &batch); err != nil {
-			return nil, false
-		}
-		responses := make([]jsonRPCResponse, 0, len(batch))
-		for _, req := range batch {
-			if resp := h.handleRequest(ctx, req); resp != nil {
-				responses = append(responses, *resp)
-			}
-		}
-		return responses, true
+	if trimmed[0] != '{' {
+		return []jsonRPCResponse{*rpcError(nil, errInvalidRequest, "expected one JSON-RPC object")}, true
 	}
 
 	var req jsonRPCRequest
@@ -109,8 +122,12 @@ func (h *Handler) handlePayload(ctx context.Context, body []byte) ([]jsonRPCResp
 }
 
 func (h *Handler) handleRequest(ctx context.Context, req jsonRPCRequest) *jsonRPCResponse {
-	if req.JSONRPC != "" && req.JSONRPC != "2.0" {
-		return req.errorResponse(errInvalidRequest, "invalid jsonrpc version")
+	if req.JSONRPC != "2.0" || req.Method == "" || !validID(req.ID) {
+		return rpcError(nil, errInvalidRequest, "invalid JSON-RPC request")
+	}
+	if isNotification(req.ID) {
+		// Notifications never execute tools or produce responses.
+		return nil
 	}
 
 	switch req.Method {
@@ -118,6 +135,8 @@ func (h *Handler) handleRequest(ctx context.Context, req jsonRPCRequest) *jsonRP
 		return h.handleInitialize(req)
 	case "notifications/initialized":
 		return nil
+	case "ping":
+		return req.resultResponse(map[string]any{})
 	case "tools/list":
 		return h.handleToolsList(req)
 	case "tools/call":
@@ -139,6 +158,9 @@ func (h *Handler) handleInitialize(req jsonRPCRequest) *jsonRPCResponse {
 	}
 	version := strings.TrimSpace(params.ProtocolVersion)
 	if version == "" {
+		return req.errorResponse(errInvalidParams, "protocolVersion is required")
+	}
+	if !supportedVersion(version) {
 		version = defaultProtocolVersion
 	}
 	result := initializeResult{
@@ -156,8 +178,10 @@ func (h *Handler) handleInitialize(req jsonRPCRequest) *jsonRPCResponse {
 
 func (h *Handler) handleToolsList(req jsonRPCRequest) *jsonRPCResponse {
 	tool := toolDef{
-		Name:        "exec",
-		Description: "Execute a shell command inside the sandboxed persistent bash session",
+		Name:         "exec",
+		Description:  "Execute a shell command inside the sandboxed persistent bash session",
+		Annotations:  map[string]bool{"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true, "idempotentHint": false},
+		OutputSchema: execOutputSchema(),
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -172,8 +196,12 @@ func (h *Handler) handleToolsList(req jsonRPCRequest) *jsonRPCResponse {
 					"maximum":     h.MaxTimeoutMs,
 				},
 			},
-			"required": []string{"cmd"},
+			"required":             []string{"cmd"},
+			"additionalProperties": false,
 		},
+	}
+	if h.Auth != nil {
+		tool.SecuritySchemes = h.Auth.SecuritySchemes()
 	}
 	return req.resultResponse(map[string]any{
 		"tools": []toolDef{tool},
@@ -195,19 +223,25 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 		return req.errorResponse(errInvalidParams, "missing arguments")
 	}
 	var args execArgs
-	if err := json.Unmarshal(params.Arguments, &args); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(params.Arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&args); err != nil {
 		return req.errorResponse(errInvalidParams, "invalid arguments")
 	}
 	if strings.TrimSpace(args.Cmd) == "" {
 		return req.errorResponse(errInvalidParams, "cmd is required")
 	}
 
-	if h.Logf != nil {
-		h.Logf("mcp tools/call request: cmd=%q timeout_ms=%d", args.Cmd, args.TimeoutMs)
-	}
-
 	timeout := args.TimeoutMs
-	if timeout <= 0 || timeout > h.MaxTimeoutMs {
+	var rawArgs map[string]json.RawMessage
+	_ = json.Unmarshal(params.Arguments, &rawArgs)
+	if _, present := rawArgs["timeout_ms"]; present && timeout == 0 {
+		return req.errorResponse(errInvalidParams, "timeout_ms must be a positive integer when provided")
+	}
+	if timeout < 0 || timeout > h.MaxTimeoutMs {
+		return req.errorResponse(errInvalidParams, "timeout_ms is out of range")
+	}
+	if timeout == 0 {
 		timeout = h.MaxTimeoutMs
 	}
 	id := atomic.AddInt64(&h.idCounter, 1)
@@ -237,24 +271,14 @@ func (h *Handler) handleToolsCall(ctx context.Context, req jsonRPCRequest) *json
 	}
 
 	if h.Logf != nil {
-		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
-		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
-		errText, errTrunc := truncateForLog(resp.Error, 4000)
 		h.Logf(
-			"mcp tools/call response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d err_len=%d stdout_trunc=%t stderr_trunc=%t err_trunc=%t stdout=%q stderr=%q error=%q",
+			"mcp tools/call response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d",
 			resp.ID,
 			resp.ExitCode,
 			resp.DurationMs,
 			resp.Truncated,
 			len(resp.Stdout),
 			len(resp.Stderr),
-			len(resp.Error),
-			stdoutTrunc,
-			stderrTrunc,
-			errTrunc,
-			stdout,
-			stderr,
-			errText,
 		)
 	}
 
@@ -306,11 +330,76 @@ func readBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, e
 	return io.ReadAll(r.Body)
 }
 
-func truncateForLog(s string, max int) (string, bool) {
-	if max <= 0 || len(s) <= max {
-		return s, false
+func supportedVersion(version string) bool {
+	return version == defaultProtocolVersion
+}
+
+func execOutputSchema() map[string]any {
+	properties := map[string]any{}
+	for _, key := range []string{"cwd", "stdout", "stderr", "error"} {
+		properties[key] = map[string]any{"type": "string"}
 	}
-	return s[:max] + "...(truncated)", true
+	for _, key := range []string{"id", "exit_code", "duration_ms"} {
+		properties[key] = map[string]any{"type": "integer"}
+	}
+	properties["truncated"] = map[string]any{"type": "boolean"}
+	return map[string]any{
+		"type": "object", "properties": properties,
+		"required": []string{"id", "exit_code", "cwd", "stdout", "stderr", "truncated", "duration_ms", "error"},
+	}
+}
+
+func accepts(header, want string) bool {
+	for _, entry := range strings.Split(header, ",") {
+		mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(entry))
+		if err == nil && params["q"] != "0" && (mediaType == want || mediaType == "*/*") {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) allowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // Native MCP clients do not send Origin.
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
+		return false
+	}
+	if h.PublicURL != "" {
+		public, err := url.Parse(h.PublicURL)
+		return err == nil && u.Scheme == public.Scheme && u.Host == public.Host
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return u.Scheme == scheme && u.Host == r.Host
+}
+
+func validID(id json.RawMessage) bool {
+	if len(id) == 0 {
+		return true
+	}
+	var value any
+	if json.Unmarshal(id, &value) != nil {
+		return false
+	}
+	switch value.(type) {
+	case string, float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func rpcError(id json.RawMessage, code int, message string) *jsonRPCResponse {
+	if len(id) == 0 {
+		id = json.RawMessage("null")
+	}
+	return &jsonRPCResponse{JSONRPC: "2.0", ID: id, Error: &jsonRPCError{Code: code, Message: message}}
 }
 
 type jsonRPCRequest struct {
@@ -333,6 +422,7 @@ type jsonRPCError struct {
 }
 
 const (
+	errParse          = -32700
 	errInvalidRequest = -32600
 	errMethodNotFound = -32601
 	errInvalidParams  = -32602
@@ -390,9 +480,12 @@ type serverInfo struct {
 }
 
 type toolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	InputSchema map[string]any `json:"inputSchema"`
+	OutputSchema    map[string]any   `json:"outputSchema"`
+	Name            string           `json:"name"`
+	Description     string           `json:"description,omitempty"`
+	InputSchema     map[string]any   `json:"inputSchema"`
+	Annotations     map[string]bool  `json:"annotations"`
+	SecuritySchemes []map[string]any `json:"securitySchemes,omitempty"`
 }
 
 type toolCallParams struct {

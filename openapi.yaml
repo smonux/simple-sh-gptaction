@@ -14,7 +14,7 @@ paths:
     post:
       summary: Execute a shell command in the persistent bash session
       operationId: execCommand
-      x-openai-isConsequential: false
+      x-openai-isConsequential: true
       security:
         - bearerAuth: []
       requestBody:

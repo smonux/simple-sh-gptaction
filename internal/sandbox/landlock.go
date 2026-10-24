@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"syscall"
 
 	llsys "github.com/landlock-lsm/go-landlock/landlock/syscall"
 	"golang.org/x/sys/unix"
@@ -20,9 +18,6 @@ type Config struct {
 }
 
 func Apply(cfg Config) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
 	abi, err := llsys.LandlockGetABIVersion()
 	if err != nil {
 		return fmt.Errorf("landlock ABI: %w", err)
@@ -103,10 +98,12 @@ func Apply(cfg Config) error {
 		}
 	}
 
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+	// Go can fork a child from any runtime thread. Restricting only this
+	// goroutine's current thread leaves siblings (and their children) unconfined.
+	if err := llsys.AllThreadsPrctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("prctl no_new_privs: %w", err)
 	}
-	if err := landlockRestrictSelf(rulesetFD, 0); err != nil {
+	if err := llsys.AllThreadsLandlockRestrictSelf(rulesetFD, 0); err != nil {
 		return fmt.Errorf("landlock restrict self: %w", err)
 	}
 	return nil
@@ -141,14 +138,6 @@ func addPathRule(rulesetFD int, parentFD int, access uint64) error {
 	}
 	if err := llsys.LandlockAddPathBeneathRule(rulesetFD, &attr, 0); err != nil {
 		return fmt.Errorf("landlock add path rule: %w", err)
-	}
-	return nil
-}
-
-func landlockRestrictSelf(rulesetFD int, flags int) error {
-	_, _, e1 := syscall.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(rulesetFD), uintptr(flags), 0)
-	if e1 != 0 {
-		return e1
 	}
 	return nil
 }

@@ -20,6 +20,7 @@ const (
 )
 
 type ServerConfig struct {
+	DisableAction        bool
 	ListenAddr           string
 	APIKey               string
 	MaxOutputChar        int
@@ -46,7 +47,12 @@ type ExecutorConfig struct {
 }
 
 func LoadServerConfig() (ServerConfig, error) {
+	disableAction, err := envBool("DISABLE_ACTION", false)
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	cfg := ServerConfig{
+		DisableAction:        disableAction,
 		ListenAddr:           envOr("LISTEN_ADDR", DefaultListenAddr),
 		APIKey:               os.Getenv("API_KEY"),
 		MaxOutputChar:        envInt("MAX_OUTPUT_CHARS", DefaultMaxOutput),
@@ -58,10 +64,13 @@ func LoadServerConfig() (ServerConfig, error) {
 		OAuthAllowedScopes:   splitSpaceList(os.Getenv("OAUTH_ALLOWED_SCOPES")),
 		OAuthRedirectURIs:    splitSpaceList(os.Getenv("OAUTH_REDIRECT_URIS")),
 		OAuthUsername:        strings.TrimSpace(os.Getenv("OAUTH_USERNAME")),
-		OAuthPassword:        strings.TrimSpace(os.Getenv("OAUTH_PASSWORD")),
+		OAuthPassword:        os.Getenv("OAUTH_PASSWORD"),
 		OAuthSQLitePath:      strings.TrimSpace(os.Getenv("OAUTH_SQLITE_PATH")),
 		PublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"),
 		AuthServerURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("AUTH_SERVER_URL")), "/"),
+	}
+	if cfg.MaxOutputChar < 1 || cfg.MaxOutputChar > 1<<20 {
+		return cfg, fmt.Errorf("MAX_OUTPUT_CHARS must be between 1 and 1048576")
 	}
 	authMode := strings.ToLower(strings.TrimSpace(cfg.AuthMode))
 	switch authMode {

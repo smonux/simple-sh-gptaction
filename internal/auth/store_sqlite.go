@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -22,35 +24,37 @@ func newSQLiteStore(path string) (*sqliteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
-		return nil, err
-	}
+	db.SetMaxOpenConns(1)
 	if err := initSQLiteSchema(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return &sqliteStore{db: db}, nil
 }
 
 func initSQLiteSchema(db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS oauth_codes (
-			code TEXT PRIMARY KEY,
+	// v2 deliberately rejects old credentials without resource/issuer binding.
+	// Old tables remain untouched so the database can still be rolled back.
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS oauth_codes_v2 (
+			code_hash TEXT PRIMARY KEY,
 			client_id TEXT NOT NULL,
 			redirect_uri TEXT NOT NULL,
 			code_challenge TEXT NOT NULL,
-			code_challenge_method TEXT NOT NULL,
-			scope TEXT,
+			resource TEXT NOT NULL,
+			scope TEXT NOT NULL,
 			expires_at INTEGER NOT NULL
-		);`,
-		`CREATE INDEX IF NOT EXISTS oauth_codes_expires ON oauth_codes(expires_at);`,
-		`CREATE TABLE IF NOT EXISTS oauth_tokens (
-			token TEXT PRIMARY KEY,
-			scope TEXT,
+		)`,
+		`CREATE INDEX IF NOT EXISTS oauth_codes_v2_expires ON oauth_codes_v2(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS oauth_tokens_v2 (
+			token_hash TEXT PRIMARY KEY,
+			resource TEXT NOT NULL,
+			issuer TEXT NOT NULL,
+			scope TEXT NOT NULL,
 			expires_at INTEGER NOT NULL
-		);`,
-		`CREATE INDEX IF NOT EXISTS oauth_tokens_expires ON oauth_tokens(expires_at);`,
-	}
-	for _, stmt := range stmts {
+		)`,
+		`CREATE INDEX IF NOT EXISTS oauth_tokens_v2_expires ON oauth_tokens_v2(expires_at)`,
+	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
@@ -58,41 +62,55 @@ func initSQLiteSchema(db *sql.DB) error {
 	return nil
 }
 
-func (s *sqliteStore) issueToken(ttl time.Duration, scope string) (issuedToken, error) {
+func credentialHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *sqliteStore) issueToken(ttl time.Duration, scope, resource, issuer string) (issuedToken, error) {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	expiresAt := time.Now().Add(ttl).Unix()
-	for i := 0; i < 5; i++ {
-		token := randomToken()
-		_, err := s.db.Exec(`INSERT INTO oauth_tokens (token, scope, expires_at) VALUES (?, ?, ?)`, token, scope, expiresAt)
-		if err == nil {
-			return issuedToken{Value: token, TTL: ttl}, nil
-		}
-		if !isUniqueViolation(err) {
-			return issuedToken{}, err
-		}
+	token := randomToken()
+	_, err := s.db.Exec(`INSERT INTO oauth_tokens_v2 (token_hash, resource, issuer, scope, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		credentialHash(token), resource, issuer, scope, time.Now().Add(ttl).Unix())
+	if err != nil {
+		return issuedToken{}, err
 	}
-	return issuedToken{}, fmt.Errorf("failed to issue unique token")
+	return issuedToken{Value: token, TTL: ttl}, nil
 }
 
-func (s *sqliteStore) validateToken(token string) (bool, error) {
+func (s *sqliteStore) validateToken(token, resource, issuer string, scopes []string) (bool, error) {
 	if token == "" {
 		return false, nil
 	}
 	now := time.Now().Unix()
-	_, _ = s.db.Exec(`DELETE FROM oauth_tokens WHERE expires_at <= ?`, now)
+	_, _ = s.db.Exec(`DELETE FROM oauth_tokens_v2 WHERE expires_at <= ?`, now)
+	var storedResource, storedIssuer, scope string
 	var expiresAt int64
-	err := s.db.QueryRow(`SELECT expires_at FROM oauth_tokens WHERE token = ?`, token).Scan(&expiresAt)
+	err := s.db.QueryRow(`SELECT resource, issuer, scope, expires_at FROM oauth_tokens_v2 WHERE token_hash = ?`,
+		credentialHash(token)).Scan(&storedResource, &storedIssuer, &scope, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if now >= expiresAt {
-		_, _ = s.db.Exec(`DELETE FROM oauth_tokens WHERE token = ?`, token)
+	if now >= expiresAt || storedResource != resource || storedIssuer != issuer {
 		return false, nil
+	}
+	granted := strings.Fields(scope)
+	for _, required := range scopes {
+		found := false
+		for _, candidate := range granted {
+			if candidate == required {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
 	}
 	return true, nil
 }
@@ -101,64 +119,35 @@ func (s *sqliteStore) issueCode(ttl time.Duration, info codeInfo) (string, error
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	expiresAt := time.Now().Add(ttl).Unix()
-	for i := 0; i < 5; i++ {
-		code := randomToken()
-		_, err := s.db.Exec(
-			`INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			code, info.clientID, info.redirectURI, info.codeChallenge, info.codeChallengeMethod, info.scope, expiresAt,
-		)
-		if err == nil {
-			return code, nil
-		}
-		if !isUniqueViolation(err) {
-			return "", err
-		}
+	code := randomToken()
+	_, err := s.db.Exec(`INSERT INTO oauth_codes_v2 (code_hash, client_id, redirect_uri, code_challenge, resource, scope, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, credentialHash(code), info.clientID, info.redirectURI,
+		info.codeChallenge, info.resource, info.scope, time.Now().Add(ttl).Unix())
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("failed to issue unique code")
+	return code, nil
 }
 
-func (s *sqliteStore) consumeCode(code, clientID, redirectURI, verifier string) (string, error) {
-	if code == "" {
-		return "", fmt.Errorf("code is required")
-	}
-	now := time.Now().Unix()
-	_, _ = s.db.Exec(`DELETE FROM oauth_codes WHERE expires_at <= ?`, now)
+func (s *sqliteStore) consumeCode(code, clientID, redirectURI, verifier, resource string) (string, error) {
+	_, _ = s.db.Exec(`DELETE FROM oauth_codes_v2 WHERE expires_at <= ?`, time.Now().Unix())
 	var info codeInfo
 	var expiresAt int64
-	err := s.db.QueryRow(
-		`SELECT client_id, redirect_uri, code_challenge, code_challenge_method, scope, expires_at
-		 FROM oauth_codes WHERE code = ?`, code,
-	).Scan(&info.clientID, &info.redirectURI, &info.codeChallenge, &info.codeChallengeMethod, &info.scope, &expiresAt)
+	// Atomic consumption prevents concurrent exchanges of the same code.
+	// A failed exchange also burns the code.
+	err := s.db.QueryRow(`DELETE FROM oauth_codes_v2 WHERE code_hash = ?
+		RETURNING client_id, redirect_uri, code_challenge, resource, scope, expires_at`,
+		credentialHash(code)).Scan(&info.clientID, &info.redirectURI, &info.codeChallenge,
+		&info.resource, &info.scope, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("invalid code")
+		return "", fmt.Errorf("invalid or expired code")
 	}
 	if err != nil {
 		return "", err
 	}
-	_, _ = s.db.Exec(`DELETE FROM oauth_codes WHERE code = ?`, code)
-	if now >= expiresAt {
-		return "", fmt.Errorf("code expired")
-	}
-	if !subtleCompare(info.clientID, clientID) {
-		return "", fmt.Errorf("invalid client_id")
-	}
-	if !subtleCompare(info.redirectURI, redirectURI) {
-		return "", fmt.Errorf("invalid redirect_uri")
-	}
-	if verifier == "" {
-		return "", fmt.Errorf("code_verifier is required")
-	}
-	if !verifyPKCE(info.codeChallengeMethod, info.codeChallenge, verifier) {
-		return "", fmt.Errorf("invalid code_verifier")
+	if time.Now().Unix() >= expiresAt || info.clientID != clientID || info.redirectURI != redirectURI ||
+		info.resource != resource || !verifyPKCE("S256", info.codeChallenge, verifier) {
+		return "", fmt.Errorf("invalid authorization grant")
 	}
 	return info.scope, nil
-}
-
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "unique")
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -71,6 +72,16 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		err   error
 	)
 	if cfg.OAuthClientID != "" {
+		if err := validateServerURL(cfg.PublicURL); err != nil {
+			return nil, fmt.Errorf("PUBLIC_URL: %w", err)
+		}
+		issuer := strings.TrimRight(cfg.AuthServerURL, "/")
+		if issuer == "" {
+			issuer = strings.TrimRight(cfg.PublicURL, "/")
+		}
+		if err := validateServerURL(issuer); err != nil {
+			return nil, fmt.Errorf("AUTH_SERVER_URL: %w", err)
+		}
 		var tokenStore tokenStore
 		var codeStore codeStore
 		if cfg.OAuthSQLitePath != "" {
@@ -100,6 +111,8 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 			Logf:          cfg.Logf,
 			TokenStore:    tokenStore,
 			CodeStore:     codeStore,
+			Resource:      strings.TrimRight(cfg.PublicURL, "/"),
+			Issuer:        issuer,
 		})
 		if err != nil {
 			return nil, err
@@ -120,7 +133,7 @@ func (a *Authorizer) OAuth() *OAuthServer {
 	return a.oauth
 }
 
-func (a *Authorizer) AuthorizeRequest(r *http.Request) bool {
+func (a *Authorizer) AuthorizeRequest(r *http.Request, scopes ...string) bool {
 	if a.mode == ModeNone {
 		return true
 	}
@@ -141,7 +154,7 @@ func (a *Authorizer) AuthorizeRequest(r *http.Request) bool {
 			a.logAuth("oauth not configured", r)
 			return false
 		}
-		ok := a.oauth.Validate(token)
+		ok := a.oauth.Validate(token, scopes...)
 		if !ok {
 			a.logAuth("oauth token invalid", r)
 		}
@@ -154,7 +167,7 @@ func (a *Authorizer) AuthorizeRequest(r *http.Request) bool {
 			a.logAuth("oauth not configured", r)
 			return false
 		}
-		ok := a.oauth.Validate(token)
+		ok := a.oauth.Validate(token, scopes...)
 		if !ok {
 			a.logAuth("oauth token invalid", r)
 		}
@@ -164,15 +177,51 @@ func (a *Authorizer) AuthorizeRequest(r *http.Request) bool {
 	}
 }
 
-func (a *Authorizer) WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
+func (a *Authorizer) WriteUnauthorized(w http.ResponseWriter, r *http.Request, scopes ...string) {
 	a.logAuth("unauthorized", r)
 	if a.mode == ModeOAuth || a.mode == ModeAny {
 		metaURL := a.resourceMetadataURL(r)
 		if metaURL != "" {
-			w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=%q", metaURL))
+			challenge := fmt.Sprintf("Bearer resource_metadata=%q", metaURL)
+			if len(scopes) > 0 {
+				challenge += fmt.Sprintf(", scope=%q", strings.Join(scopes, " "))
+			}
+			if parseBearer(r) != "" {
+				if len(scopes) > 0 && a.AuthorizeRequest(r) {
+					challenge += `, error="insufficient_scope", error_description="tools.execute permission is required"`
+					w.Header().Set("WWW-Authenticate", challenge)
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				challenge += `, error="invalid_token"`
+			}
+			w.Header().Set("WWW-Authenticate", challenge)
 		}
 	}
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+// SecuritySchemes describes OAuth linking to MCP hosts. Fixed API keys are a
+// separate option for other clients, not anonymous access in ChatGPT.
+func (a *Authorizer) SecuritySchemes() []map[string]any {
+	if a.mode == ModeNone {
+		return []map[string]any{{"type": "noauth"}}
+	}
+	if a.oauth != nil && (a.mode == ModeOAuth || a.mode == ModeAny) {
+		return []map[string]any{{"type": "oauth2", "scopes": []string{"tools.execute"}}}
+	}
+	return nil
+}
+
+func validateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("an absolute HTTPS URL without credentials, query or fragment is required")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")) {
+		return fmt.Errorf("HTTPS is required (HTTP is allowed only on loopback for development)")
+	}
+	return nil
 }
 
 func (a *Authorizer) logAuth(msg string, r *http.Request) {

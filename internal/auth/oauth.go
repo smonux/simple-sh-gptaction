@@ -10,11 +10,14 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type OAuthConfig struct {
+	Resource      string
+	Issuer        string
 	ClientID      string
 	TokenTTL      time.Duration
 	CodeTTL       time.Duration
@@ -28,6 +31,9 @@ type OAuthConfig struct {
 }
 
 type OAuthServer struct {
+	loginAttempts loginLimiter
+	resource      string
+	issuer        string
 	clientID      string
 	tokenTTL      time.Duration
 	codeTTL       time.Duration
@@ -41,7 +47,19 @@ type OAuthServer struct {
 }
 
 func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
+	if err := validateServerURL(cfg.Resource); err != nil {
+		return nil, fmt.Errorf("OAuth resource: %w", err)
+	}
+	if err := validateServerURL(cfg.Issuer); err != nil {
+		return nil, fmt.Errorf("OAuth issuer: %w", err)
+	}
+	if cfg.ClientID == "" || cfg.Username == "" || cfg.Password == "" {
+		return nil, fmt.Errorf("OAuth client ID and local login credentials are required")
+	}
 	allowed := map[string]struct{}{}
+	if len(cfg.AllowedScopes) == 0 {
+		cfg.AllowedScopes = []string{"tools.read", "tools.execute"}
+	}
 	for _, scope := range cfg.AllowedScopes {
 		if scope == "" {
 			continue
@@ -54,12 +72,20 @@ func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
 		if uri == "" {
 			continue
 		}
+		if err := validateServerURL(uri); err != nil {
+			return nil, fmt.Errorf("OAuth redirect URI: %w", err)
+		}
 		redirects[uri] = struct{}{}
+	}
+	if len(redirects) == 0 {
+		return nil, fmt.Errorf("OAUTH_REDIRECT_URIS must contain an explicit allowlist")
 	}
 	if cfg.TokenStore == nil || cfg.CodeStore == nil {
 		return nil, fmt.Errorf("oauth token/code stores are required")
 	}
 	return &OAuthServer{
+		resource:      cfg.Resource,
+		issuer:        cfg.Issuer,
 		clientID:      cfg.ClientID,
 		tokenTTL:      cfg.TokenTTL,
 		codeTTL:       cfg.CodeTTL,
@@ -74,6 +100,11 @@ func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
 }
 
 func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -104,21 +135,26 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	params.RedirectURI = redirectURI
 
-	if params.CodeChallenge == "" {
+	if !validChallenge(params.CodeChallenge) {
 		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s missing_code_challenge", params.ClientID)
 		o.writeAuthorizeError(w, r, params, "invalid_request", "code_challenge is required")
 		return
 	}
-	method := params.CodeChallengeMethod
-	if method == "" {
-		method = "plain"
-	}
-	if method != "S256" && method != "plain" {
-		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s code_challenge_method=%s", params.ClientID, method)
+	if params.CodeChallengeMethod != "S256" {
+		o.logfSafe("oauth authorize error: code=invalid_request client_id=%s code_challenge_method=%s", params.ClientID, params.CodeChallengeMethod)
 		o.writeAuthorizeError(w, r, params, "invalid_request", "unsupported code_challenge_method")
 		return
 	}
-	params.CodeChallengeMethod = method
+	if params.Resource != o.resource {
+		o.writeAuthorizeError(w, r, params, "invalid_target", "resource must match this MCP server")
+		return
+	}
+	scope, err := o.validateScopes(params.Scope)
+	if err != nil {
+		o.writeAuthorizeError(w, r, params, "invalid_scope", err.Error())
+		return
+	}
+	params.Scope = scope
 
 	if o.username == "" || o.password == "" {
 		o.logfSafe("oauth authorize error: login not configured")
@@ -126,24 +162,34 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		o.renderLogin(w, params, "")
+		o.renderLogin(w, r, params, "")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
 		o.logfSafe("oauth authorize error: invalid form")
-		o.renderLogin(w, params, "invalid form")
+		o.renderLogin(w, r, params, "invalid form")
 		return
 	}
-	user := strings.TrimSpace(r.FormValue("username"))
-	pass := strings.TrimSpace(r.FormValue("password"))
+	cookie, err := r.Cookie("gptsh_login_csrf")
+	if err != nil || !subtleCompare(cookie.Value, r.PostFormValue("csrf_token")) || cookie.Value == "" {
+		http.Error(w, "login form expired; restart authorization", http.StatusForbidden)
+		return
+	}
+	user := strings.TrimSpace(r.PostFormValue("username"))
+	if retry := o.loginAttempts.retryAfter(time.Now()); retry > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+	pass := r.PostFormValue("password")
 	if !subtleCompare(user, o.username) || !subtleCompare(pass, o.password) {
 		o.logfSafe("oauth authorize error: invalid credentials client_id=%s redirect_uri=%s", params.ClientID, params.RedirectURI)
-		o.renderLogin(w, params, "invalid credentials")
+		o.renderLogin(w, r, params, "invalid credentials")
 		return
 	}
 
-	scope := o.filterScopes(params.Scope)
 	code, err := o.codes.issueCode(o.codeTTL, codeInfo{
+		resource:            o.resource,
 		clientID:            o.clientID,
 		redirectURI:         params.RedirectURI,
 		codeChallenge:       params.CodeChallenge,
@@ -157,7 +203,7 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	o.logfSafe("oauth authorize success: client_id=%s redirect_uri=%s scope=%s", params.ClientID, params.RedirectURI, scope)
 
-	redirect, err := buildRedirectURL(params.RedirectURI, code, params.State, "")
+	redirect, err := buildRedirectURL(params.RedirectURI, code, params.State, "", o.issuer)
 	if err != nil {
 		o.logfSafe("oauth authorize error: invalid redirect_uri client_id=%s redirect_uri=%s", params.ClientID, params.RedirectURI)
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
@@ -167,6 +213,9 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -192,7 +241,13 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 
 	grantType := strings.TrimSpace(r.FormValue("grant_type"))
 	if grantType == "" {
-		grantType = "authorization_code"
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "grant_type is required")
+		return
+	}
+	resource := r.PostFormValue("resource")
+	if resource != o.resource {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource must match this MCP server")
+		return
 	}
 	if grantType != "authorization_code" {
 		o.logfSafe("oauth token error: unsupported_grant_type client_id=%s grant_type=%s", clientID, grantType)
@@ -214,14 +269,14 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scope, err := o.codes.consumeCode(code, clientID, redirectURI, verifier)
+	scope, err := o.codes.consumeCode(code, clientID, redirectURI, verifier, resource)
 	if err != nil {
 		o.logfSafe("oauth token error: invalid_grant client_id=%s redirect_uri=%s", clientID, redirectURI)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		return
 	}
 
-	token, err := o.tokens.issueToken(o.tokenTTL, scope)
+	token, err := o.tokens.issueToken(o.tokenTTL, scope, resource, o.issuer)
 	if err != nil {
 		o.logfSafe("oauth token error: server_error client_id=%s", clientID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token")
@@ -243,23 +298,24 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (o *OAuthServer) Validate(token string) bool {
-	ok, _ := o.tokens.validateToken(token)
+func (o *OAuthServer) Validate(token string, scopes ...string) bool {
+	ok, _ := o.tokens.validateToken(token, o.resource, o.issuer, scopes)
 	return ok
 }
 
-func (o *OAuthServer) filterScopes(scope string) string {
-	if scope == "" || len(o.allowedScopes) == 0 {
-		return scope
+func (o *OAuthServer) validateScopes(scope string) (string, error) {
+	if scope == "" {
+		scope = "tools.execute"
 	}
 	parts := strings.Fields(scope)
 	out := make([]string, 0, len(parts))
 	for _, s := range parts {
-		if _, ok := o.allowedScopes[s]; ok {
-			out = append(out, s)
+		if _, ok := o.allowedScopes[s]; !ok {
+			return "", fmt.Errorf("unsupported scope")
 		}
+		out = append(out, s)
 	}
-	return strings.Join(out, " ")
+	return strings.Join(out, " "), nil
 }
 
 func (o *OAuthServer) validClient(id string) bool {
@@ -279,26 +335,33 @@ func (o *OAuthServer) resolveRedirectURI(redirectURI string) (string, error) {
 		}
 		return "", fmt.Errorf("redirect_uri is required")
 	}
-	if len(o.redirectURIs) == 0 {
-		return redirectURI, nil
-	}
 	if _, ok := o.redirectURIs[redirectURI]; !ok {
 		return "", fmt.Errorf("redirect_uri not allowed")
 	}
 	return redirectURI, nil
 }
 
-func (o *OAuthServer) renderLogin(w http.ResponseWriter, params authorizeParams, errMsg string) {
+func (o *OAuthServer) renderLogin(w http.ResponseWriter, r *http.Request, params authorizeParams, errMsg string) {
+	csrfToken := randomToken()
+	http.SetCookie(w, &http.Cookie{
+		Name: "gptsh_login_csrf", Value: csrfToken, Path: "/oauth/authorize",
+		HttpOnly: true, Secure: strings.HasPrefix(o.resource, "https://"),
+		SameSite: http.SameSiteLaxMode, MaxAge: 600,
+	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	var b strings.Builder
 	b.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize</title></head><body>")
-	b.WriteString("<h1>Authorize</h1>")
+	b.WriteString("<h1>Authorize gptsh</h1><p>This grants access to your personal persistent shell, including file changes and network commands.</p>")
 	if errMsg != "" {
 		b.WriteString("<p style=\"color:red\">")
 		b.WriteString(html.EscapeString(errMsg))
 		b.WriteString("</p>")
 	}
-	b.WriteString("<form method=\"post\">")
+	b.WriteString("<form method=\"post\" action=\"")
+	b.WriteString(html.EscapeString(r.URL.Path))
+	b.WriteString("\">")
+	writeHidden(&b, "csrf_token", csrfToken)
+	writeHidden(&b, "resource", params.Resource)
 	b.WriteString("<label>Username <input name=\"username\" /></label><br/>")
 	b.WriteString("<label>Password <input type=\"password\" name=\"password\" /></label><br/>")
 	writeHidden(&b, "response_type", params.ResponseType)
@@ -331,12 +394,13 @@ func parseAuthorizeParams(r *http.Request) (authorizeParams, error) {
 		if err := r.ParseForm(); err != nil {
 			return params, err
 		}
-		values = r.Form
+		values = r.PostForm
 	}
 	params.ResponseType = strings.TrimSpace(values.Get("response_type"))
 	params.ClientID = strings.TrimSpace(values.Get("client_id"))
 	params.RedirectURI = strings.TrimSpace(values.Get("redirect_uri"))
 	params.Scope = strings.TrimSpace(values.Get("scope"))
+	params.Resource = values.Get("resource")
 	params.State = strings.TrimSpace(values.Get("state"))
 	params.CodeChallenge = strings.TrimSpace(values.Get("code_challenge"))
 	params.CodeChallengeMethod = strings.TrimSpace(values.Get("code_challenge_method"))
@@ -359,7 +423,7 @@ func (o *OAuthServer) writeAuthorizeError(w http.ResponseWriter, r *http.Request
 		http.Error(w, desc, http.StatusBadRequest)
 		return
 	}
-	redirect, err := buildRedirectURL(redirectURI, "", params.State, code)
+	redirect, err := buildRedirectURL(redirectURI, "", params.State, code, o.issuer)
 	if err != nil {
 		http.Error(w, desc, http.StatusBadRequest)
 		return
@@ -367,12 +431,13 @@ func (o *OAuthServer) writeAuthorizeError(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, redirect, http.StatusFound)
 }
 
-func buildRedirectURL(redirectURI, code, state, errCode string) (string, error) {
+func buildRedirectURL(redirectURI, code, state, errCode, issuer string) (string, error) {
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
 		return "", err
 	}
 	q := parsed.Query()
+	q.Set("iss", issuer)
 	if errCode != "" {
 		q.Set("error", errCode)
 	} else {
@@ -430,6 +495,7 @@ func (o *OAuthServer) logfSafe(format string, args ...any) {
 }
 
 type authorizeParams struct {
+	Resource            string
 	ResponseType        string
 	ClientID            string
 	RedirectURI         string
@@ -440,8 +506,8 @@ type authorizeParams struct {
 }
 
 type tokenStore interface {
-	issueToken(ttl time.Duration, scope string) (issuedToken, error)
-	validateToken(token string) (bool, error)
+	issueToken(ttl time.Duration, scope, resource, issuer string) (issuedToken, error)
+	validateToken(token, resource, issuer string, scopes []string) (bool, error)
 }
 
 type issuedToken struct {
@@ -450,6 +516,7 @@ type issuedToken struct {
 }
 
 type codeInfo struct {
+	resource            string
 	clientID            string
 	redirectURI         string
 	codeChallenge       string
@@ -460,16 +527,19 @@ type codeInfo struct {
 
 type codeStore interface {
 	issueCode(ttl time.Duration, info codeInfo) (string, error)
-	consumeCode(code, clientID, redirectURI, verifier string) (string, error)
+	consumeCode(code, clientID, redirectURI, verifier, resource string) (string, error)
 }
 
 func verifyPKCE(method, challenge, verifier string) bool {
-	if method == "" {
-		method = "plain"
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return false
+	}
+	for _, c := range verifier {
+		if !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~", c) {
+			return false
+		}
 	}
 	switch method {
-	case "plain":
-		return subtleCompare(challenge, verifier)
 	case "S256":
 		sum := sha256.Sum256([]byte(verifier))
 		encoded := base64.RawURLEncoding.EncodeToString(sum[:])
@@ -477,6 +547,11 @@ func verifyPKCE(method, challenge, verifier string) bool {
 	default:
 		return false
 	}
+}
+
+func validChallenge(challenge string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(challenge)
+	return err == nil && len(decoded) == sha256.Size && len(challenge) == 43
 }
 
 func randomToken() string {

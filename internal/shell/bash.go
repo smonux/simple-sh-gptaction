@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gptsh/internal/config"
 )
 
 const (
@@ -36,6 +38,7 @@ func Start(path string) (*Bash, error) {
 	}
 
 	cmd := exec.Command(path, "--noprofile", "--norc")
+	cmd.Env = config.ShellEnvironment(os.Environ())
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -88,14 +91,28 @@ func (b *Bash) Exec(cmd string, maxOutput int) (string, string, int, string, boo
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	state := &captureState{max: maxOutput}
+	token := randToken()
+	marker := "\x1eGPTSH_END_" + token + "\x1f"
+	state := &captureState{max: maxOutput, marker: []byte(marker), done: make(chan struct{})}
 	b.capture.set(state)
 	defer b.capture.clear()
 
-	token := randToken()
 	delim := "__GPTSH_" + token + "__"
 
-	wrapper := fmt.Sprintf("__GPTSH_T=\"%s\"\n__DELIM=\"%s\"\nprintf 'BEGIN\\t%%s\\n' \"$__GPTSH_T\" >&3\n__CMD=$(cat <<'%s'\n%s\n%s\n)\neval \"$__CMD\"\n__EC=$?\nprintf 'END\\t%%s\\t%%d\\t%%s\\n' \"$__GPTSH_T\" \"$__EC\" \"$PWD\" >&3\n", token, delim, delim, cmd, delim)
+	// Each output pipe needs its own barrier: control fd 3 can overtake the
+	// goroutines draining stdout/stderr even though Bash wrote the output first.
+	wrapper := fmt.Sprintf(`__GPTSH_T="%s"
+printf 'BEGIN\t%%s\n' "$__GPTSH_T" >&3
+__CMD=$(cat <<'%s'
+%s
+%s
+)
+eval "$__CMD"
+__EC=$?
+printf '\036GPTSH_END_%s\037'
+printf '\036GPTSH_END_%s\037' >&2
+printf 'END\t%%s\t%%d\t%%s\n' "$__GPTSH_T" "$__EC" "$PWD" >&3
+`, token, delim, cmd, delim, token, token)
 
 	start := time.Now()
 	if _, err := io.WriteString(b.stdin, wrapper); err != nil {
@@ -109,6 +126,7 @@ func (b *Bash) Exec(cmd string, maxOutput int) (string, string, int, string, boo
 	if err != nil {
 		return "", "", -1, "", false, 0, err
 	}
+	<-state.done
 	elapsed := time.Since(start).Milliseconds()
 	return state.stdout.String(), state.stderr.String(), exitCode, cwd, state.truncated, elapsed, nil
 }

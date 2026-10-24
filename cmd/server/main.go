@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gptsh/internal/auth"
@@ -29,14 +30,22 @@ const (
 )
 
 type execClient struct {
-	mu     sync.Mutex
+	gate   chan struct{}
+	path   string
+	env    []string
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.Reader
 }
 
 func newExecClient(path string) (*execClient, error) {
+	return newExecClientWithEnvironment(path, config.ExecutorEnvironment(os.Environ()))
+}
+
+func newExecClientWithEnvironment(path string, environ []string) (*execClient, error) {
 	cmd := exec.Command(path)
+	cmd.Env = environ
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -50,41 +59,54 @@ func newExecClient(path string) (*execClient, error) {
 		return nil, err
 	}
 
-	return &execClient{cmd: cmd, stdin: stdin, stdout: stdout}, nil
+	return &execClient{gate: make(chan struct{}, 1), path: path, env: environ, cmd: cmd, stdin: stdin, stdout: stdout}, nil
 }
 
 func (c *execClient) close() {
 	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-		_, _ = c.cmd.Process.Wait()
+		_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+		_ = c.stdin.Close()
+		_ = c.cmd.Wait()
+		c.cmd = nil
 	}
 }
 
 func (c *execClient) restart(path string) error {
 	c.close()
-	client, err := newExecClient(path)
+	client, err := newExecClientWithEnvironment(path, c.env)
 	if err != nil {
 		return err
 	}
-	*c = *client
+	// Keep the original gate while replacing only the process and its pipes.
+	c.cmd, c.stdin, c.stdout = client.cmd, client.stdin, client.stdout
 	return nil
 }
 
 func (c *execClient) exec(ctx context.Context, req proto.ExecRequest) (proto.ExecResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case c.gate <- struct{}{}:
+		defer func() { <-c.gate }()
+	case <-ctx.Done():
+		return proto.ExecResponse{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return proto.ExecResponse{}, err
+	}
 
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return proto.ExecResponse{}, err
 	}
 	if err := proto.WriteFrame(c.stdin, payload); err != nil {
+		_ = c.restart(c.path)
 		return proto.ExecResponse{}, err
 	}
 
 	respCh := make(chan proto.ExecResponse, 1)
 	errCh := make(chan error, 1)
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		frame, err := proto.ReadFrame(c.stdout)
 		if err != nil {
 			errCh <- err
@@ -100,8 +122,17 @@ func (c *execClient) exec(ctx context.Context, req proto.ExecRequest) (proto.Exe
 
 	select {
 	case <-ctx.Done():
+		// Killing the process group also closes the framing reader. Join it
+		// before starting a new executor to avoid stale responses and races.
+		c.close()
+		<-readDone
+		if err := c.restart(c.path); err != nil {
+			log.Printf("executor restart failed: %v", err)
+		}
 		return proto.ExecResponse{}, ctx.Err()
 	case err := <-errCh:
+		<-readDone
+		_ = c.restart(c.path)
 		return proto.ExecResponse{}, err
 	case resp := <-respCh:
 		return resp, nil
@@ -114,10 +145,11 @@ type execRequest struct {
 }
 
 type openAPICache struct {
-	once    sync.Once
-	yaml    []byte
-	json    []byte
-	loadErr error
+	once      sync.Once
+	publicURL string
+	yaml      []byte
+	json      []byte
+	loadErr   error
 }
 
 type staticFileCache struct {
@@ -159,10 +191,18 @@ func (c *openAPICache) load() {
 		c.loadErr = err
 		return
 	}
-	c.yaml = data
-
-	var doc any
+	var doc map[string]any
 	if err := yaml.Unmarshal(data, &doc); err != nil {
+		c.loadErr = err
+		return
+	}
+	// Source examples remain generic; the running Action advertises its own
+	// configured URL without committing a private deployment domain to Git.
+	if c.publicURL != "" {
+		doc["servers"] = []map[string]string{{"url": c.publicURL}}
+	}
+	c.yaml, err = yaml.Marshal(doc)
+	if err != nil {
 		c.loadErr = err
 		return
 	}
@@ -217,11 +257,14 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
-func withCORS(next http.Handler) http.Handler {
+func withCORS(next http.Handler, publicURL string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if origin := r.Header.Get("Origin"); origin != "" && origin == publicURL {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, MCP-Protocol-Version, MCP-Session-Id")
 		w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
@@ -232,21 +275,11 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func truncateForLog(s string, max int) (string, bool) {
-	if max <= 0 || len(s) <= max {
-		return s, false
-	}
-	return s[:max] + "...(truncated)", true
-}
-
 func main() {
 	cfg, err := config.LoadServerConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-
-	openapi := &openAPICache{}
-	privacyPolicy := &staticFileCache{name: "privacy-policy.html"}
 
 	authorizer, err := auth.NewAuthorizer(auth.Config{
 		Mode:                 cfg.AuthMode,
@@ -280,8 +313,8 @@ func main() {
 			return
 		}
 
-		if !authorizer.AuthorizeRequest(r) {
-			authorizer.WriteUnauthorized(w, r)
+		if !authorizer.AuthorizeRequest(r, "tools.execute") {
+			authorizer.WriteUnauthorized(w, r, "tools.execute")
 			return
 		}
 
@@ -295,8 +328,6 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-
-		log.Printf("exec request: cmd=%q timeout_ms=%d", req.Cmd, req.TimeoutMs)
 
 		timeout := req.TimeoutMs
 		if timeout <= 0 || timeout > maxTimeoutMs {
@@ -316,7 +347,6 @@ func main() {
 		resp, err := client.exec(ctx, execReq)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				_ = client.restart(cfg.ExecutorPath)
 				resp = proto.ExecResponse{
 					ID:       id,
 					ExitCode: 124,
@@ -329,21 +359,14 @@ func main() {
 			}
 		}
 
-		stdout, stdoutTrunc := truncateForLog(resp.Stdout, 4000)
-		stderr, stderrTrunc := truncateForLog(resp.Stderr, 4000)
 		log.Printf(
-			"exec response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d stdout_trunc=%t stderr_trunc=%t stdout=%q stderr=%q error=%q",
+			"exec response: id=%d exit=%d duration_ms=%d truncated=%t stdout_len=%d stderr_len=%d",
 			resp.ID,
 			resp.ExitCode,
 			resp.DurationMs,
 			resp.Truncated,
 			len(resp.Stdout),
 			len(resp.Stderr),
-			stdoutTrunc,
-			stderrTrunc,
-			stdout,
-			stderr,
-			resp.Error,
 		)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -358,39 +381,57 @@ func main() {
 		MaxTimeoutMs:   maxTimeoutMs,
 		MaxOutputChars: cfg.MaxOutputChar,
 		ServerName:     "gptsh-mcp",
-		ServerVersion:  "1.0.0",
+		ServerVersion:  "1.1.0",
+		PublicURL:      cfg.PublicURL,
 	}
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           logRequests(limitRequests(withCORS(newHTTPHandler(cfg, authorizer, mcpHandler, execHandler), cfg.PublicURL), 16)),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      65 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
+	log.Printf("listening on %s", cfg.ListenAddr)
+	log.Fatal(srv.ListenAndServe())
+}
 
+func newHTTPHandler(cfg config.ServerConfig, authorizer *auth.Authorizer, mcpHandler http.Handler, execHandler http.Handler) http.Handler {
+	openapi := &openAPICache{publicURL: cfg.PublicURL}
+	privacyPolicy := &staticFileCache{name: "privacy-policy.html"}
 	mux := http.NewServeMux()
-	mux.Handle("/exec", execHandler)
-	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		data, err := openapi.getJSON()
-		if err != nil || len(data) == 0 {
-			log.Printf("openapi.json error: %v", err)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(data)
-	})
-	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		data, err := openapi.getYAML()
-		if err != nil || len(data) == 0 {
-			log.Printf("openapi.yaml error: %v", err)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/yaml")
-		_, _ = w.Write(data)
-	})
+	if !cfg.DisableAction {
+		mux.Handle("/exec", execHandler)
+		mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			data, err := openapi.getJSON()
+			if err != nil || len(data) == 0 {
+				log.Printf("openapi.json error: %v", err)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(data)
+		})
+		mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			data, err := openapi.getYAML()
+			if err != nil || len(data) == 0 {
+				log.Printf("openapi.yaml error: %v", err)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write(data)
+		})
+	}
 	privacyPolicyHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -411,19 +452,24 @@ func main() {
 	mux.HandleFunc("/privacy-policy", privacyPolicyHandler)
 	mux.HandleFunc("/privacy-policy.html", privacyPolicyHandler)
 	mux.Handle("/mcp", mcpHandler)
-	mux.Handle("/", mcpHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Older connections may have stored the bare origin as their MCP URL.
+		// Only alias the exact root; unknown paths (including disabled Actions)
+		// must still return 404.
+		if r.URL.Path == "/" {
+			mcpHandler.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 
 	if authorizer.OAuth() != nil {
 		mux.HandleFunc("/oauth/authorize", authorizer.OAuth().HandleAuthorize)
 		mux.HandleFunc("/oauth/token", authorizer.OAuth().HandleToken)
 		mux.HandleFunc("/.well-known/oauth-protected-resource", authorizer.HandleProtectedResource)
+		mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", authorizer.HandleProtectedResource)
 		mux.HandleFunc("/.well-known/oauth-authorization-server", authorizer.HandleAuthorizationServerMetadata)
 	}
 
-	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: logRequests(withCORS(mux)),
-	}
-	log.Printf("listening on %s", cfg.ListenAddr)
-	log.Fatal(srv.ListenAndServe())
+	return mux
 }

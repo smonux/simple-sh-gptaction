@@ -1,0 +1,17 @@
+[Unit]
+Description=gptsh MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@WORKING_DIRECTORY@
+ExecStart=@EXEC_START@
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

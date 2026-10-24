@@ -3,9 +3,14 @@ package auth
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 )
 
 func (a *Authorizer) HandleProtectedResource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	if a.oauth == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -28,6 +33,10 @@ func (a *Authorizer) HandleProtectedResource(w http.ResponseWriter, r *http.Requ
 }
 
 func (a *Authorizer) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	if a.oauth == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -38,13 +47,14 @@ func (a *Authorizer) HandleAuthorizationServerMetadata(w http.ResponseWriter, r 
 		return
 	}
 	resp := map[string]any{
-		"issuer":                                issuer,
-		"authorization_endpoint":                issuer + "/oauth/authorize",
-		"token_endpoint":                        issuer + "/oauth/token",
-		"token_endpoint_auth_methods_supported": []string{"none"},
-		"grant_types_supported":                 []string{"authorization_code"},
-		"response_types_supported":              []string{"code"},
-		"code_challenge_methods_supported":      []string{"S256", "plain"},
+		"issuer":                                         issuer,
+		"authorization_endpoint":                         issuer + "/oauth/authorize",
+		"token_endpoint":                                 issuer + "/oauth/token",
+		"token_endpoint_auth_methods_supported":          []string{"none"},
+		"grant_types_supported":                          []string{"authorization_code"},
+		"response_types_supported":                       []string{"code"},
+		"code_challenge_methods_supported":               []string{"S256"},
+		"authorization_response_iss_parameter_supported": true,
 	}
 	if scopes := a.oauthAllowedScopes(); len(scopes) > 0 {
 		resp["scopes_supported"] = scopes
@@ -61,5 +71,6 @@ func (a *Authorizer) oauthAllowedScopes() []string {
 	for s := range a.oauth.allowedScopes {
 		out = append(out, s)
 	}
+	sort.Strings(out)
 	return out
 }
