@@ -87,6 +87,7 @@ Optional:
 
 - `OAUTH_ALLOWED_SCOPES` – space-separated scopes (defaults to `tools.read tools.execute`). Calling `exec` requires `tools.execute`; a `tools.read` token can initialize and list tools but cannot execute commands.
 - `OAUTH_TOKEN_TTL_SECONDS`
+- `OAUTH_REFRESH_TOKEN_TTL_SECONDS` – maximum lifetime of a refresh grant, in seconds (default 2592000 / 30 days; maximum 365 days)
 - `OAUTH_CODE_TTL_SECONDS`
 - `AUTH_SERVER_URL` – issuer base URL, defaulting to `PUBLIC_URL`. If overridden, it must route to this server's OAuth handlers; this is not an external identity-provider setting.
 
@@ -105,10 +106,13 @@ OAuth endpoints:
 - Copy the exact callback URL displayed by ChatGPT into `OAUTH_REDIRECT_URIS`. Do not use the old Actions callback `/aip/oauth/callback`. The example uses `https://chatgpt.com/connector_platform_oauth_redirect`; the displayed callback is authoritative.
 - Use `AUTH_MODE=oauth` for OAuth only, or `any` to keep API-key access for other clients. `any` is not anonymous/OAuth mixed authentication: every MCP request requires a Bearer credential.
 - You authenticate on this server's form using `OAUTH_USERNAME` and `OAUTH_PASSWORD`. No external provider is contacted. The form uses a CSRF cookie and requires cookies in your browser.
-- Clients send the exact advertised `resource` on both authorization and token requests. Tokens are checked for expiry, issuer, resource and execution scope.
+- Clients send the advertised `resource` on authorization and token requests. An empty HTTP root path and `/` are treated as equivalent for SDK compatibility; tokens always retain the configured canonical audience. Tokens are checked for expiry, issuer, resource and execution scope.
 - Only PKCE S256 is accepted. Authorization responses include `iss`, and redirect URLs must be explicitly allowlisted.
 - Login is limited to five POST attempts per minute for the single account, across all IP addresses. Excess attempts return 429 and `Retry-After`. The limit also counts successful attempts and resets when the process restarts.
-- Access tokens expire after `OAUTH_TOKEN_TTL_SECONDS` (default one hour). There is no refresh-token grant; reconnect/re-authorize when required.
+- Access tokens expire after `OAUTH_TOKEN_TTL_SECONDS` (default one hour). The code exchange also issues a refresh token, so clients such as ChatGPT can renew access automatically without reopening the login form.
+- Renewal uses form-encoded `POST /oauth/token` with `grant_type=refresh_token`, the same `client_id`, and the latest `refresh_token`. If `resource` is sent it must match the original resource; if omitted the original resource is retained. Omit `scope` to retain permissions, or request a narrower subset. PKCE and `redirect_uri` are only needed for the initial code exchange.
+- Every renewal returns a new access/refresh pair. Persist the new refresh token and serialize renewals for the connection. Reusing a consumed token revokes its entire token family, including descendant access tokens, and requires a new login.
+- Refresh tokens and replay-detection hashes persist in SQLite across restarts. The refresh grant expires 30 days after the initial login by default; rotation does not extend this absolute deadline. The `refresh_expires_in` response field reports its remaining lifetime. A new login is needed after grant expiry or revocation.
 
 See [OpenAI MCP authentication](https://developers.openai.com/plugins/build/auth) and [custom MCP connections](https://developers.openai.com/api/docs/guides/custom-mcp-server).
 
@@ -161,6 +165,11 @@ resource binding are not accepted. New credentials use separate `*_v2` SQLite
 tables with hashed codes/tokens; old tables are preserved. Refresh the connection's
 tool metadata to pick up the annotations.
 
+When upgrading from a version without refresh tokens, re-authorize the ChatGPT
+connection once to obtain the first refresh token and refresh its OAuth metadata.
+Existing access tokens remain valid until their normal expiry; they cannot be
+converted into refresh credentials without an authorization-code exchange.
+
 Set `DISABLE_ACTION=true` in `config.env` and restart when ready to disable the
 old Action. Leaving it unset preserves those endpoints.
 
@@ -194,6 +203,9 @@ or restart the installed service. Dependencies are declared in the script.
 
 The end-to-end check also verifies that test API/OAuth credentials and an
 arbitrary private environment variable do not appear in Bash's initial environment.
+It also exercises the official SDK's automatic OAuth renewal without opening
+a login form. Go tests cover refresh expiry, persistence, scope narrowing,
+client/resource/issuer binding, rotation, replay revocation and concurrent use.
 
 You can also use MCP Inspector (`npx @modelcontextprotocol/inspector`) with
 Streamable HTTP and the `/mcp` URL to inspect your deployed connection and OAuth

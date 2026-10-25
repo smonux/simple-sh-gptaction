@@ -19,19 +19,20 @@ const (
 )
 
 type Config struct {
-	Mode                 string
-	APIKey               string
-	OAuthClientID        string
-	OAuthTokenTTLSeconds int
-	OAuthCodeTTLSeconds  int
-	OAuthAllowedScopes   []string
-	OAuthRedirectURIs    []string
-	OAuthUsername        string
-	OAuthPassword        string
-	OAuthSQLitePath      string
-	PublicURL            string
-	AuthServerURL        string
-	Logf                 func(string, ...any)
+	Mode                   string
+	APIKey                 string
+	OAuthClientID          string
+	OAuthTokenTTLSeconds   int
+	OAuthRefreshTTLSeconds int
+	OAuthCodeTTLSeconds    int
+	OAuthAllowedScopes     []string
+	OAuthRedirectURIs      []string
+	OAuthUsername          string
+	OAuthPassword          string
+	OAuthSQLitePath        string
+	PublicURL              string
+	AuthServerURL          string
+	Logf                   func(string, ...any)
 }
 
 type Authorizer struct {
@@ -103,6 +104,7 @@ func NewAuthorizer(cfg Config) (*Authorizer, error) {
 		oauth, err = NewOAuthServer(OAuthConfig{
 			ClientID:      cfg.OAuthClientID,
 			TokenTTL:      ttl,
+			RefreshTTL:    time.Duration(cfg.OAuthRefreshTTLSeconds) * time.Second,
 			CodeTTL:       codeTTL,
 			AllowedScopes: cfg.OAuthAllowedScopes,
 			RedirectURIs:  cfg.OAuthRedirectURIs,

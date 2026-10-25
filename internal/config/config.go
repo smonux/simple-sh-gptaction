@@ -16,26 +16,28 @@ const (
 	DefaultExecutorPath = "./executor"
 	DefaultAuthMode     = "api_key"
 	DefaultTokenTTL     = 3600
+	DefaultRefreshTTL   = 30 * 24 * 60 * 60
 	DefaultCodeTTL      = 600
 )
 
 type ServerConfig struct {
-	DisableAction        bool
-	ListenAddr           string
-	APIKey               string
-	MaxOutputChar        int
-	ExecutorPath         string
-	AuthMode             string
-	OAuthClientID        string
-	OAuthTokenTTLSeconds int
-	OAuthCodeTTLSeconds  int
-	OAuthAllowedScopes   []string
-	OAuthRedirectURIs    []string
-	OAuthUsername        string
-	OAuthPassword        string
-	OAuthSQLitePath      string
-	PublicURL            string
-	AuthServerURL        string
+	DisableAction          bool
+	ListenAddr             string
+	APIKey                 string
+	MaxOutputChar          int
+	ExecutorPath           string
+	AuthMode               string
+	OAuthClientID          string
+	OAuthTokenTTLSeconds   int
+	OAuthRefreshTTLSeconds int
+	OAuthCodeTTLSeconds    int
+	OAuthAllowedScopes     []string
+	OAuthRedirectURIs      []string
+	OAuthUsername          string
+	OAuthPassword          string
+	OAuthSQLitePath        string
+	PublicURL              string
+	AuthServerURL          string
 }
 
 type ExecutorConfig struct {
@@ -52,25 +54,29 @@ func LoadServerConfig() (ServerConfig, error) {
 		return ServerConfig{}, err
 	}
 	cfg := ServerConfig{
-		DisableAction:        disableAction,
-		ListenAddr:           envOr("LISTEN_ADDR", DefaultListenAddr),
-		APIKey:               os.Getenv("API_KEY"),
-		MaxOutputChar:        envInt("MAX_OUTPUT_CHARS", DefaultMaxOutput),
-		ExecutorPath:         envOr("EXECUTOR_PATH", DefaultExecutorPath),
-		AuthMode:             envOr("AUTH_MODE", DefaultAuthMode),
-		OAuthClientID:        strings.TrimSpace(os.Getenv("OAUTH_CLIENT_ID")),
-		OAuthTokenTTLSeconds: envInt("OAUTH_TOKEN_TTL_SECONDS", DefaultTokenTTL),
-		OAuthCodeTTLSeconds:  envInt("OAUTH_CODE_TTL_SECONDS", DefaultCodeTTL),
-		OAuthAllowedScopes:   splitSpaceList(os.Getenv("OAUTH_ALLOWED_SCOPES")),
-		OAuthRedirectURIs:    splitSpaceList(os.Getenv("OAUTH_REDIRECT_URIS")),
-		OAuthUsername:        strings.TrimSpace(os.Getenv("OAUTH_USERNAME")),
-		OAuthPassword:        os.Getenv("OAUTH_PASSWORD"),
-		OAuthSQLitePath:      strings.TrimSpace(os.Getenv("OAUTH_SQLITE_PATH")),
-		PublicURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"),
-		AuthServerURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("AUTH_SERVER_URL")), "/"),
+		DisableAction:          disableAction,
+		ListenAddr:             envOr("LISTEN_ADDR", DefaultListenAddr),
+		APIKey:                 os.Getenv("API_KEY"),
+		MaxOutputChar:          envInt("MAX_OUTPUT_CHARS", DefaultMaxOutput),
+		ExecutorPath:           envOr("EXECUTOR_PATH", DefaultExecutorPath),
+		AuthMode:               envOr("AUTH_MODE", DefaultAuthMode),
+		OAuthClientID:          strings.TrimSpace(os.Getenv("OAUTH_CLIENT_ID")),
+		OAuthTokenTTLSeconds:   envInt("OAUTH_TOKEN_TTL_SECONDS", DefaultTokenTTL),
+		OAuthRefreshTTLSeconds: envInt("OAUTH_REFRESH_TOKEN_TTL_SECONDS", DefaultRefreshTTL),
+		OAuthCodeTTLSeconds:    envInt("OAUTH_CODE_TTL_SECONDS", DefaultCodeTTL),
+		OAuthAllowedScopes:     splitSpaceList(os.Getenv("OAUTH_ALLOWED_SCOPES")),
+		OAuthRedirectURIs:      splitSpaceList(os.Getenv("OAUTH_REDIRECT_URIS")),
+		OAuthUsername:          strings.TrimSpace(os.Getenv("OAUTH_USERNAME")),
+		OAuthPassword:          os.Getenv("OAUTH_PASSWORD"),
+		OAuthSQLitePath:        strings.TrimSpace(os.Getenv("OAUTH_SQLITE_PATH")),
+		PublicURL:              strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"),
+		AuthServerURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("AUTH_SERVER_URL")), "/"),
 	}
 	if cfg.MaxOutputChar < 1 || cfg.MaxOutputChar > 1<<20 {
 		return cfg, fmt.Errorf("MAX_OUTPUT_CHARS must be between 1 and 1048576")
+	}
+	if cfg.OAuthRefreshTTLSeconds < 1 || cfg.OAuthRefreshTTLSeconds > 365*24*60*60 {
+		return cfg, fmt.Errorf("OAUTH_REFRESH_TOKEN_TTL_SECONDS must be between 1 and 31536000")
 	}
 	authMode := strings.ToLower(strings.TrimSpace(cfg.AuthMode))
 	switch authMode {

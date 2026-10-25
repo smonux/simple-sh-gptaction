@@ -36,6 +36,7 @@ func initSQLiteSchema(db *sql.DB) error {
 	// v2 deliberately rejects old credentials without resource/issuer binding.
 	// Old tables remain untouched so the database can still be rolled back.
 	for _, stmt := range []string{
+		`PRAGMA foreign_keys = ON`,
 		`CREATE TABLE IF NOT EXISTS oauth_codes_v2 (
 			code_hash TEXT PRIMARY KEY,
 			client_id TEXT NOT NULL,
@@ -54,6 +55,27 @@ func initSQLiteSchema(db *sql.DB) error {
 			expires_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS oauth_tokens_v2_expires ON oauth_tokens_v2(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS oauth_refresh_families (
+			family_id TEXT PRIMARY KEY,
+			client_id TEXT NOT NULL,
+			resource TEXT NOT NULL,
+			issuer TEXT NOT NULL,
+			expires_at INTEGER NOT NULL,
+			revoked INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS oauth_refresh_families_expires ON oauth_refresh_families(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+			token_hash TEXT PRIMARY KEY,
+			family_id TEXT NOT NULL REFERENCES oauth_refresh_families(family_id) ON DELETE CASCADE,
+			scope TEXT NOT NULL,
+			consumed INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_family ON oauth_refresh_tokens(family_id)`,
+		`CREATE TABLE IF NOT EXISTS oauth_refresh_access (
+			token_hash TEXT PRIMARY KEY REFERENCES oauth_tokens_v2(token_hash) ON DELETE CASCADE,
+			family_id TEXT NOT NULL REFERENCES oauth_refresh_families(family_id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS oauth_refresh_access_family ON oauth_refresh_access(family_id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -88,8 +110,11 @@ func (s *sqliteStore) validateToken(token, resource, issuer string, scopes []str
 	_, _ = s.db.Exec(`DELETE FROM oauth_tokens_v2 WHERE expires_at <= ?`, now)
 	var storedResource, storedIssuer, scope string
 	var expiresAt int64
-	err := s.db.QueryRow(`SELECT resource, issuer, scope, expires_at FROM oauth_tokens_v2 WHERE token_hash = ?`,
-		credentialHash(token)).Scan(&storedResource, &storedIssuer, &scope, &expiresAt)
+	err := s.db.QueryRow(`SELECT t.resource, t.issuer, t.scope, t.expires_at FROM oauth_tokens_v2 t
+		LEFT JOIN oauth_refresh_access a ON a.token_hash = t.token_hash
+		LEFT JOIN oauth_refresh_families f ON f.family_id = a.family_id
+		WHERE t.token_hash = ? AND (a.family_id IS NULL OR (f.revoked = 0 AND f.expires_at > ?))`,
+		credentialHash(token), now).Scan(&storedResource, &storedIssuer, &scope, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

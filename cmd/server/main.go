@@ -282,19 +282,20 @@ func main() {
 	}
 
 	authorizer, err := auth.NewAuthorizer(auth.Config{
-		Mode:                 cfg.AuthMode,
-		APIKey:               cfg.APIKey,
-		OAuthClientID:        cfg.OAuthClientID,
-		OAuthTokenTTLSeconds: cfg.OAuthTokenTTLSeconds,
-		OAuthCodeTTLSeconds:  cfg.OAuthCodeTTLSeconds,
-		OAuthAllowedScopes:   cfg.OAuthAllowedScopes,
-		OAuthRedirectURIs:    cfg.OAuthRedirectURIs,
-		OAuthUsername:        cfg.OAuthUsername,
-		OAuthPassword:        cfg.OAuthPassword,
-		OAuthSQLitePath:      cfg.OAuthSQLitePath,
-		PublicURL:            cfg.PublicURL,
-		AuthServerURL:        cfg.AuthServerURL,
-		Logf:                 log.Printf,
+		Mode:                   cfg.AuthMode,
+		APIKey:                 cfg.APIKey,
+		OAuthClientID:          cfg.OAuthClientID,
+		OAuthTokenTTLSeconds:   cfg.OAuthTokenTTLSeconds,
+		OAuthRefreshTTLSeconds: cfg.OAuthRefreshTTLSeconds,
+		OAuthCodeTTLSeconds:    cfg.OAuthCodeTTLSeconds,
+		OAuthAllowedScopes:     cfg.OAuthAllowedScopes,
+		OAuthRedirectURIs:      cfg.OAuthRedirectURIs,
+		OAuthUsername:          cfg.OAuthUsername,
+		OAuthPassword:          cfg.OAuthPassword,
+		OAuthSQLitePath:        cfg.OAuthSQLitePath,
+		PublicURL:              cfg.PublicURL,
+		AuthServerURL:          cfg.AuthServerURL,
+		Logf:                   log.Printf,
 	})
 	if err != nil {
 		log.Fatalf("auth: %v", err)

@@ -20,6 +20,7 @@ type OAuthConfig struct {
 	Issuer        string
 	ClientID      string
 	TokenTTL      time.Duration
+	RefreshTTL    time.Duration
 	CodeTTL       time.Duration
 	AllowedScopes []string
 	RedirectURIs  []string
@@ -36,6 +37,7 @@ type OAuthServer struct {
 	issuer        string
 	clientID      string
 	tokenTTL      time.Duration
+	refreshTTL    time.Duration
 	codeTTL       time.Duration
 	allowedScopes map[string]struct{}
 	redirectURIs  map[string]struct{}
@@ -47,6 +49,9 @@ type OAuthServer struct {
 }
 
 func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
+	if cfg.RefreshTTL <= 0 {
+		cfg.RefreshTTL = 30 * 24 * time.Hour
+	}
 	if err := validateServerURL(cfg.Resource); err != nil {
 		return nil, fmt.Errorf("OAuth resource: %w", err)
 	}
@@ -88,6 +93,7 @@ func NewOAuthServer(cfg OAuthConfig) (*OAuthServer, error) {
 		issuer:        cfg.Issuer,
 		clientID:      cfg.ClientID,
 		tokenTTL:      cfg.TokenTTL,
+		refreshTTL:    cfg.RefreshTTL,
 		codeTTL:       cfg.CodeTTL,
 		allowedScopes: allowed,
 		redirectURIs:  redirects,
@@ -145,10 +151,11 @@ func (o *OAuthServer) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		o.writeAuthorizeError(w, r, params, "invalid_request", "unsupported code_challenge_method")
 		return
 	}
-	if params.Resource != o.resource {
+	if !o.matchesResource(params.Resource) {
 		o.writeAuthorizeError(w, r, params, "invalid_target", "resource must match this MCP server")
 		return
 	}
+	params.Resource = o.resource
 	scope, err := o.validateScopes(params.Scope)
 	if err != nil {
 		o.writeAuthorizeError(w, r, params, "invalid_scope", err.Error())
@@ -239,19 +246,28 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	grantType := strings.TrimSpace(r.FormValue("grant_type"))
+	grantType := strings.TrimSpace(r.PostFormValue("grant_type"))
 	if grantType == "" {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "grant_type is required")
 		return
 	}
 	resource := r.PostFormValue("resource")
-	if resource != o.resource {
+	if grantType == "refresh_token" && resource == "" {
+		// RFC 8707 permits omission on refresh; retain the bound resource.
+		resource = o.resource
+	}
+	if !o.matchesResource(resource) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_target", "resource must match this MCP server")
+		return
+	}
+	resource = o.resource
+	if grantType == "refresh_token" {
+		o.handleRefresh(w, r, clientID, resource)
 		return
 	}
 	if grantType != "authorization_code" {
 		o.logfSafe("oauth token error: unsupported_grant_type client_id=%s grant_type=%s", clientID, grantType)
-		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only authorization_code is supported")
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "supported grants: authorization_code and refresh_token")
 		return
 	}
 
@@ -276,20 +292,59 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := o.tokens.issueToken(o.tokenTTL, scope, resource, o.issuer)
+	token, err := o.tokens.issueTokenPair(o.tokenTTL, o.refreshTTL, scope, clientID, resource, o.issuer)
 	if err != nil {
 		o.logfSafe("oauth token error: server_error client_id=%s", clientID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue token")
 		return
 	}
-	o.logfSafe("oauth token success: client_id=%s scope=%s expires_in=%d", clientID, scope, int(token.TTL.Seconds()))
-	resp := map[string]any{
-		"access_token": token.Value,
-		"token_type":   "Bearer",
-		"expires_in":   int(token.TTL.Seconds()),
+	o.logfSafe("oauth token success: grant_type=authorization_code client_id=%q expires_in=%d", clientID, int(token.TTL.Seconds()))
+	writeTokenPair(w, token)
+}
+
+func (o *OAuthServer) handleRefresh(w http.ResponseWriter, r *http.Request, clientID, resource string) {
+	refresh := r.PostFormValue("refresh_token")
+	if refresh == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "refresh_token is required")
+		return
 	}
+	scope := strings.TrimSpace(r.PostFormValue("scope"))
 	if scope != "" {
-		resp["scope"] = scope
+		if _, err := o.validateScopes(scope); err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "unsupported scope")
+			return
+		}
+	}
+	token, err := o.tokens.rotateRefreshToken(o.tokenTTL, refresh, clientID, resource, o.issuer, scope)
+	if err != nil {
+		switch {
+		case errors.Is(err, errRefreshScope):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "scope exceeds the original grant")
+		case errors.Is(err, errRefreshInvalid), errors.Is(err, errRefreshReused):
+			// Never expose a credential or distinguish a random token from an
+			// expired/revoked grant in the response or logs.
+			o.logfSafe("oauth refresh rejected: client_id=%q", clientID)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh grant is invalid, expired or revoked; authorize again")
+		default:
+			o.logfSafe("oauth refresh storage error")
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not refresh token")
+		}
+		return
+	}
+	o.logfSafe("oauth token success: grant_type=refresh_token client_id=%q expires_in=%d", clientID, int(token.TTL.Seconds()))
+	writeTokenPair(w, token)
+}
+
+func writeTokenPair(w http.ResponseWriter, token issuedTokenPair) {
+	resp := map[string]any{
+		"access_token":       token.Value,
+		"token_type":         "Bearer",
+		"expires_in":         int(token.TTL.Seconds()),
+		"refresh_token":      token.RefreshToken,
+		"refresh_expires_in": int(token.RefreshTTL.Seconds()),
+	}
+	if token.Scope != "" {
+		resp["scope"] = token.Scope
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -301,6 +356,17 @@ func (o *OAuthServer) HandleToken(w http.ResponseWriter, r *http.Request) {
 func (o *OAuthServer) Validate(token string, scopes ...string) bool {
 	ok, _ := o.tokens.validateToken(token, o.resource, o.issuer, scopes)
 	return ok
+}
+
+func (o *OAuthServer) matchesResource(resource string) bool {
+	if resource == o.resource {
+		return true
+	}
+	// URI normalization treats an empty HTTP path and '/' as the same root.
+	// Some SDK URL types add this slash. Do not normalize other path variants,
+	// hosts, ports, queries or fragments; tokens retain the configured audience.
+	u, err := url.Parse(o.resource)
+	return err == nil && u.Path == "" && resource == o.resource+"/"
 }
 
 func (o *OAuthServer) validateScopes(scope string) (string, error) {
@@ -508,6 +574,15 @@ type authorizeParams struct {
 type tokenStore interface {
 	issueToken(ttl time.Duration, scope, resource, issuer string) (issuedToken, error)
 	validateToken(token, resource, issuer string, scopes []string) (bool, error)
+	issueTokenPair(accessTTL, refreshTTL time.Duration, scope, clientID, resource, issuer string) (issuedTokenPair, error)
+	rotateRefreshToken(accessTTL time.Duration, token, clientID, resource, issuer, scope string) (issuedTokenPair, error)
+}
+
+type issuedTokenPair struct {
+	issuedToken
+	RefreshToken string
+	RefreshTTL   time.Duration
+	Scope        string
 }
 
 type issuedToken struct {

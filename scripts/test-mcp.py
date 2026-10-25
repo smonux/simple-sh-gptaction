@@ -17,15 +17,71 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import time
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.auth.oauth2 import OAuthClientProvider
+from mcp.client.streamable_http import streamablehttp_client, streamable_http_client
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthMetadata, OAuthToken, ProtectedResourceMetadata
 
 
 ROOT = Path(__file__).resolve().parent.parent
 REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
+
+
+class TestTokenStorage:
+    """An in-memory client token store; never prints or writes credentials."""
+
+    def __init__(self, token_response: dict, issuer: str):
+        self.tokens = OAuthToken.model_validate(token_response)
+        self.client_info = OAuthClientInformationFull(
+            client_id="sdk-test", redirect_uris=[REDIRECT],
+            token_endpoint_auth_method="none", issuer=issuer,
+        )
+        self.refresh_count = 0
+
+    async def get_tokens(self):
+        return self.tokens
+
+    async def set_tokens(self, tokens):
+        self.tokens = tokens
+        self.refresh_count += 1
+
+    async def get_client_info(self):
+        return self.client_info
+
+    async def set_client_info(self, client_info):
+        self.client_info = client_info
+
+
+async def verify_automatic_refresh(base_url: str, token_response: dict, metadata: dict, resource: dict) -> str:
+    async def no_login(*_args):
+        raise AssertionError("SDK unexpectedly required interactive login")
+
+    storage = TestTokenStorage(token_response, base_url)
+    provider = OAuthClientProvider(
+        server_url=f"{base_url}/mcp",
+        client_metadata=OAuthClientMetadata(redirect_uris=[REDIRECT], token_endpoint_auth_method="none"),
+        storage=storage, redirect_handler=no_login, callback_handler=no_login,
+    )
+    # Model the state held by a client after its initial authorization, then
+    # simulate reaching expiry without waiting an hour. The SDK itself builds
+    # and sends the refresh request and persists the rotated credentials.
+    provider.context.oauth_metadata = OAuthMetadata.model_validate(metadata)
+    provider.context.protected_resource_metadata = ProtectedResourceMetadata.model_validate(resource)
+    provider.context.token_expiry_time = time.time() - 1
+    async with httpx.AsyncClient(auth=provider) as client:
+        async with streamable_http_client(f"{base_url}/mcp", http_client=client) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                assert (await session.list_tools()).tools[0].name == "exec"
+    assert storage.refresh_count == 1
+    assert storage.tokens.access_token != token_response["access_token"]
+    assert storage.tokens.refresh_token != token_response["refresh_token"]
+    print("Official MCP SDK: automatic OAuth refresh without interactive login passed")
+    return storage.tokens.access_token
 
 
 async def verify_mcp(base_url: str, token: str) -> None:
@@ -74,6 +130,7 @@ async def run_checks(base_url: str, inspector_cli: str | None, directory: str) -
             assert (await client.post(path)).status_code == 404
         metadata = (await client.get("/.well-known/oauth-authorization-server")).json()
         assert metadata["code_challenge_methods_supported"] == ["S256"]
+        assert "refresh_token" in metadata["grant_types_supported"]
         resource = (await client.get("/.well-known/oauth-protected-resource")).json()
         assert resource["resource"] == base_url
 
@@ -100,8 +157,11 @@ async def run_checks(base_url: str, inspector_cli: str | None, directory: str) -
             "resource": base_url, "code_verifier": verifier,
         })
         response.raise_for_status()
-        token = response.json()["access_token"]
+        token_response = response.json()
+        assert token_response["refresh_token"]
+        token = token_response["access_token"]
         await verify_mcp(base_url, token)
+        token = await verify_automatic_refresh(base_url, token_response, metadata, resource)
         if inspector_cli:
             common = [
                 "node", inspector_cli, "--transport", "http", "--server-url", f"{base_url}/mcp",
